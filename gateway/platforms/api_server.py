@@ -983,8 +983,28 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_model = runtime_kwargs.pop("model", None)
         reasoning_config = GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
+        if runtime_model:
+            logger.info(
+                "Runtime provider supplied explicit model override: %s -> %s",
+                model,
+                runtime_model,
+            )
+            model = runtime_model
+        if not model and runtime_kwargs.get("provider"):
+            try:
+                from hermes_cli.models import get_default_model_for_provider
+                model = get_default_model_for_provider(runtime_kwargs["provider"])
+                if model:
+                    logger.info(
+                        "No model configured - defaulting to %s for provider %s",
+                        model,
+                        runtime_kwargs["provider"],
+                    )
+            except Exception:
+                pass
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
