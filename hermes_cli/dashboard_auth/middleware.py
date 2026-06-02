@@ -185,34 +185,47 @@ async def gated_auth_middleware(
         return await call_next(request)
 
     at, _rt = read_session_cookies(request)
-    if not at:
+    if not at and not _rt:
+        # Neither token present — no session at all. Nothing to verify or
+        # refresh; force login.
         return _unauth_response(request, reason="no_cookie")
 
     # Try every registered provider's verify_session in turn. Providers
     # MUST return None for tokens they don't recognise (not raise). This
     # lets multiple providers stack — the first one that recognises a
     # token wins.
+    #
+    # When the access-token cookie is absent but a refresh-token cookie is
+    # present, skip verification and go straight to the refresh path below.
+    # This is the COMMON expiry case, not an edge case: the access-token
+    # cookie is set with ``Max-Age = access_token_expires_in`` (~15 min), so
+    # the browser EVICTS it the moment the token lapses, while the
+    # refresh-token cookie lives for 30 days. From that point the browser
+    # sends only ``hermes_session_rt``. If we bailed on ``not at`` here we'd
+    # bounce the user to /login on every expiry despite holding a perfectly
+    # good refresh token — defeating the whole transparent-refresh feature.
     session = None
-    for provider in list_providers():
-        try:
-            session = provider.verify_session(access_token=at)
-        except ProviderError as e:
-            _log.warning(
-                "dashboard-auth: provider %r unreachable during verify: %s",
-                provider.name, e,
-            )
-            audit_log(
-                AuditEvent.SESSION_VERIFY_FAILURE,
-                provider=provider.name,
-                reason="provider_unreachable",
-                ip=_client_ip(request),
-            )
-            return JSONResponse(
-                {"detail": f"Auth provider {provider.name!r} unreachable"},
-                status_code=503,
-            )
-        if session is not None:
-            break
+    if at:
+        for provider in list_providers():
+            try:
+                session = provider.verify_session(access_token=at)
+            except ProviderError as e:
+                _log.warning(
+                    "dashboard-auth: provider %r unreachable during verify: %s",
+                    provider.name, e,
+                )
+                audit_log(
+                    AuditEvent.SESSION_VERIFY_FAILURE,
+                    provider=provider.name,
+                    reason="provider_unreachable",
+                    ip=_client_ip(request),
+                )
+                return JSONResponse(
+                    {"detail": f"Auth provider {provider.name!r} unreachable"},
+                    status_code=503,
+                )
+            if session is not None:
+                break
 
     if session is None:
         # Access token is expired/invalid. Before forcing re-login, try to
