@@ -61,6 +61,14 @@ from gateway.platforms.base import (
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_RUN_MODEL_ALLOWLIST = {
+    "claude-sonnet-4-6",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+}
+
 
 def _hermes_version() -> str:
     """Return the hermes-agent version string, or "dev" if it can't be resolved.
@@ -1010,6 +1018,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        reasoning_override: Optional[Dict[str, Any]] = None,
+        model_override: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1032,7 +1042,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         runtime_model = runtime_kwargs.pop("model", None)
-        reasoning_config = GatewayRunner._load_reasoning_config()
+        reasoning_config = reasoning_override if reasoning_override is not None else GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
         if runtime_model:
             logger.info(
@@ -1053,6 +1063,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
             except Exception:
                 pass
+        if model_override:
+            model = model_override
+            self._apply_model_override_provider(runtime_kwargs, model_override)
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -1083,6 +1096,63 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=gateway_session_key,
         )
         return agent
+
+    def _run_model_allowlist(self) -> set[str]:
+        raw = os.getenv("HERMES_RUN_MODEL_ALLOWLIST", "")
+        if not raw.strip():
+            return set(_DEFAULT_RUN_MODEL_ALLOWLIST)
+        return {item.strip() for item in raw.split(",") if item.strip()}
+
+    def _infer_provider_for_model_override(self, model: str) -> Optional[str]:
+        lowered = model.strip().lower()
+        if lowered.startswith("claude") or lowered.startswith("anthropic/claude"):
+            return "anthropic"
+        if lowered.startswith("gpt-"):
+            return "openai-codex"
+        return None
+
+    def _apply_model_override_provider(self, runtime_kwargs: Dict[str, Any], model: str) -> None:
+        provider = self._infer_provider_for_model_override(model)
+        if not provider or runtime_kwargs.get("provider") == provider:
+            return
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            runtime = resolve_runtime_provider(requested=provider)
+        except Exception as exc:
+            logger.warning("Could not resolve provider for run model override %s: %s", model, exc)
+            return
+        runtime_kwargs.update({
+            "api_key": runtime.get("api_key"),
+            "base_url": runtime.get("base_url"),
+            "provider": runtime.get("provider"),
+            "api_mode": runtime.get("api_mode"),
+            "command": runtime.get("command"),
+            "args": list(runtime.get("args") or []),
+            "credential_pool": runtime.get("credential_pool"),
+        })
+
+    def _parse_run_reasoning_effort(self, body: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        raw = body.get("reasoning_effort", body.get("agentEffort"))
+        if raw is None or raw == "":
+            return None, None
+        if not isinstance(raw, str):
+            return None, web.json_response(_openai_error("'reasoning_effort' must be a string"), status=400)
+        from hermes_constants import parse_reasoning_effort
+        parsed = parse_reasoning_effort(raw)
+        if parsed is None:
+            return None, web.json_response(_openai_error("Invalid reasoning_effort; expected none|minimal|low|medium|high|xhigh"), status=400)
+        return parsed, None
+
+    def _parse_run_model_override(self, body: Dict[str, Any]) -> tuple[Optional[str], Optional["web.Response"]]:
+        raw = body.get("model")
+        if raw is None or raw == "":
+            return None, None
+        if not isinstance(raw, str):
+            return None, web.json_response(_openai_error("'model' must be a string"), status=400)
+        model = raw.strip()
+        if model not in self._run_model_allowlist():
+            return None, web.json_response(_openai_error("Requested model is not allowlisted for per-run override"), status=400)
+        return model, None
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -3675,6 +3745,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+        reasoning_override, reasoning_err = self._parse_run_reasoning_effort(body)
+        if reasoning_err is not None:
+            return reasoning_err
+        model_override, model_err = self._parse_run_model_override(body)
+        if model_err is not None:
+            return model_err
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
@@ -3752,7 +3828,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "queued",
             created_at=created_at,
             session_id=session_id,
-            model=body.get("model", self._model_name),
+            model=model_override or self._model_name,
+            reasoning_effort=body.get("reasoning_effort", body.get("agentEffort")),
         )
 
         async def _run_and_close():
@@ -3764,6 +3841,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                     gateway_session_key=gateway_session_key,
+                    reasoning_override=reasoning_override,
+                    model_override=model_override,
                 )
                 self._active_run_agents[run_id] = agent
 
