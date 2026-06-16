@@ -549,3 +549,51 @@ async def test_async_delegation_watcher_defers_busy_session(monkeypatch):
     assert injected == []
     assert process_registry.completion_queue.qsize() == 1
     assert process_registry.completion_queue.get_nowait()["delegation_id"] == "deleg_x1"
+
+
+
+def test_async_delegation_completion_event_preserves_api_routing_metadata():
+    """API/chat runs use unparseable run/session ids, so async events must carry explicit routing."""
+    def runner():
+        return {"status": "completed", "summary": "api result"}
+
+    res = ad.dispatch_async_delegation(
+        goal="api task",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="run_unparseable_123",
+        routing_metadata={
+            "platform": "api_server",
+            "chat_type": "dm",
+            "chat_id": "api_session_abc",
+            "session_id": "api_session_abc",
+            "run_id": "run_unparseable_123",
+        },
+        runner=runner,
+        max_async_children=3,
+    )
+    assert res["status"] == "dispatched"
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["type"] == "async_delegation"
+    assert evt["session_key"] == "run_unparseable_123"
+    assert evt["platform"] == "api_server"
+    assert evt["chat_type"] == "dm"
+    assert evt["chat_id"] == "api_session_abc"
+    assert evt["api_session_id"] == "api_session_abc"
+    assert evt["api_run_id"] == "run_unparseable_123"
+
+
+def test_gateway_builds_source_from_api_async_event_explicit_metadata():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    evt = _make_async_evt(session_key="run_unparseable_123")
+    evt.update({"platform": "api_server", "chat_type": "dm", "chat_id": "api_session_abc"})
+    source = runner._build_process_event_source(evt)
+    assert source is not None
+    assert source.platform.value == "api_server"
+    assert source.chat_id == "api_session_abc"
+    assert source.chat_type == "dm"

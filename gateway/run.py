@@ -12054,6 +12054,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 break
         if not adapter:
             return
+        if hasattr(adapter, "inject_process_notification"):
+            try:
+                await adapter.inject_process_notification(synth_text, evt, source)
+            except Exception as e:
+                logger.error("Process notification adapter injection error: %s", e)
+            return
         try:
             synth_event = MessageEvent(
                 text=synth_text,

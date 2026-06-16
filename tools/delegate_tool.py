@@ -2250,10 +2250,28 @@ def delegate_task(
         if background:
             from tools.async_delegation import dispatch_async_delegation
             from tools.approval import get_current_session_key
+            from gateway.session_context import get_session_env
 
-            # Capture the gateway routing key on THIS (parent) thread — the
-            # daemon worker won't carry the session contextvar.
-            _session_key = get_current_session_key(default="")
+            # Capture gateway/API routing on THIS (parent) thread — the daemon
+            # worker won't carry contextvars. API-server runs may use opaque
+            # run/session ids as approval keys, so preserve explicit platform
+            # metadata as well as the session_key.
+            _routing_metadata = {
+                "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
+                "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
+                "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", ""),
+                "user_id": get_session_env("HERMES_SESSION_USER_ID", ""),
+                "user_name": get_session_env("HERMES_SESSION_USER_NAME", ""),
+                "message_id": get_session_env("HERMES_SESSION_MESSAGE_ID", ""),
+                "session_id": get_session_env("HERMES_SESSION_ID", ""),
+            }
+            _routing_metadata = {k: v for k, v in _routing_metadata.items() if v}
+            if _routing_metadata.get("platform") and not _routing_metadata.get("chat_type"):
+                _routing_metadata["chat_type"] = "dm"
+            # Capture the gateway routing key. Prefer the approval/session key,
+            # then the session context key for API chat paths that don't use
+            # approvals.
+            _session_key = get_current_session_key(default="") or get_session_env("HERMES_SESSION_KEY", "")
 
             # Detach the child from the parent's interrupt-propagation list.
             # _build_child_agent registered it there (correct for sync
@@ -2296,6 +2314,7 @@ def delegate_task(
                 model=creds["model"],
                 session_key=_session_key,
                 runner=_async_runner,
+                routing_metadata=_routing_metadata,
                 interrupt_fn=_async_interrupt,
                 max_async_children=_get_max_async_children(),
             )

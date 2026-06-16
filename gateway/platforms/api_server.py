@@ -3601,13 +3601,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _run():
             from gateway.session_context import clear_session_vars, set_session_vars
+            from tools.approval import reset_current_session_key, set_current_session_key
 
+            routing_key = gateway_session_key or session_id or ""
             tokens = set_session_vars(
                 platform="api_server",
                 chat_id=session_id or "",
-                session_key=gateway_session_key or session_id or "",
+                session_key=routing_key,
                 session_id=session_id or "",
             )
+            approval_token = set_current_session_key(routing_key) if routing_key else None
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -3639,6 +3642,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     result["session_id"] = _eff_sid
                 return result, usage
             finally:
+                if approval_token is not None:
+                    try:
+                        reset_current_session_key(approval_token)
+                    except Exception:
+                        pass
                 clear_session_vars(tokens)
 
         return await loop.run_in_executor(None, _run)
@@ -3883,7 +3891,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         approval_token = set_current_session_key(approval_session_key)
                         session_tokens = set_session_vars(
                             platform="api_server",
+                            chat_id=session_id or run_id,
                             session_key=approval_session_key,
+                            session_id=session_id or run_id,
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
                         r = agent.run_conversation(
@@ -4392,6 +4402,66 @@ class APIServerAdapter(BasePlatformAdapter):
             self._runner = None
         self._app = None
         logger.info("[%s] API server stopped", self.name)
+
+    async def inject_process_notification(self, synth_text: str, evt: Dict[str, Any], source: Any) -> None:
+        """Re-enter API-server async background results as a persisted follow-up turn.
+
+        HTTP clients cannot receive adapter.send() callbacks after the original
+        request closes. For API/chat sessions, route the synthetic completion
+        through a new agent turn on the same SessionDB session so clients that
+        poll /api/sessions/{id}/messages see the delegated result and the
+        parent assistant's follow-up response.
+        """
+        session_id = str(
+            evt.get("api_session_id")
+            or evt.get("session_id")
+            or getattr(source, "chat_id", "")
+            or ""
+        ).strip()
+        if not session_id:
+            logger.warning("API async delegation notification missing session id: %s", evt)
+            return
+        history = self._conversation_history_for_session(session_id)
+        result, usage = await self._run_agent(
+            user_message=synth_text,
+            conversation_history=history,
+            session_id=session_id,
+            gateway_session_key=str(evt.get("session_key") or "") or None,
+        )
+        run_id = str(evt.get("api_run_id") or "").strip()
+        final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+        if run_id:
+            self._set_run_status(
+                run_id,
+                self._run_statuses.get(run_id, {}).get("status", "completed"),
+                last_event="async_delegation.completed",
+                async_delegation={
+                    "delegation_id": evt.get("delegation_id"),
+                    "session_id": session_id,
+                    "status": evt.get("status"),
+                    "injected": True,
+                    "assistant_output": final_response,
+                    "usage": usage,
+                },
+            )
+            q = self._run_streams.get(run_id)
+            if q is not None:
+                try:
+                    q.put_nowait({
+                        "event": "async_delegation.completed",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "delegation_id": evt.get("delegation_id"),
+                        "session_id": session_id,
+                        "output": final_response,
+                    })
+                except Exception:
+                    pass
+        logger.info(
+            "API async delegation %s injected into session %s",
+            evt.get("delegation_id"),
+            session_id,
+        )
 
     async def send(
         self,

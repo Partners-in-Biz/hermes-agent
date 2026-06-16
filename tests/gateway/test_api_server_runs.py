@@ -527,3 +527,37 @@ class TestStopRun:
                 body = await events_resp.text()
                 # Stream should have received run.failed and closed
                 assert "run.failed" in body or "stream closed" in body
+
+
+@pytest.mark.asyncio
+async def test_api_async_delegation_notification_reenters_same_session(adapter, monkeypatch):
+    calls = []
+
+    async def fake_run_agent(**kwargs):
+        calls.append(kwargs)
+        return {"final_response": "parent saw background result"}, {"total_tokens": 1}
+
+    monkeypatch.setattr(adapter, "_conversation_history_for_session", lambda session_id: [{"role": "user", "content": "original"}])
+    monkeypatch.setattr(adapter, "_run_agent", fake_run_agent)
+    adapter._set_run_status("run_unparseable_123", "completed", created_at=1)
+
+    source = type("Source", (), {"chat_id": "api_session_abc"})()
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_x1",
+        "session_key": "run_unparseable_123",
+        "api_session_id": "api_session_abc",
+        "api_run_id": "run_unparseable_123",
+        "status": "completed",
+    }
+
+    await adapter.inject_process_notification("[IMPORTANT: async result]", evt, source)
+
+    assert calls
+    assert calls[0]["session_id"] == "api_session_abc"
+    assert calls[0]["user_message"] == "[IMPORTANT: async result]"
+    assert calls[0]["gateway_session_key"] == "run_unparseable_123"
+    status = adapter._run_statuses["run_unparseable_123"]
+    assert status["last_event"] == "async_delegation.completed"
+    assert status["async_delegation"]["injected"] is True
+    assert status["async_delegation"]["session_id"] == "api_session_abc"

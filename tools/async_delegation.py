@@ -158,6 +158,7 @@ def dispatch_async_delegation(
     model: Optional[str],
     session_key: str,
     runner: Callable[[], Dict[str, Any]],
+    routing_metadata: Optional[Dict[str, Any]] = None,
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
 ) -> Dict[str, Any]:
@@ -200,6 +201,7 @@ def dispatch_async_delegation(
         "role": role,
         "model": model,
         "session_key": session_key,
+        "routing_metadata": dict(routing_metadata or {}),
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -302,6 +304,8 @@ def _push_completion_event(
     dispatched_at = record.get("dispatched_at") or time.time()
     completed_at = record.get("completed_at") or time.time()
 
+    routing = record.get("routing_metadata") or {}
+
     evt = {
         "type": "async_delegation",
         "delegation_id": record.get("delegation_id"),
@@ -324,6 +328,22 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    for key in (
+        "platform",
+        "chat_type",
+        "chat_id",
+        "thread_id",
+        "user_id",
+        "user_name",
+        "message_id",
+    ):
+        value = routing.get(key)
+        if value:
+            evt[key] = str(value)
+    if routing.get("session_id"):
+        evt["api_session_id"] = str(routing["session_id"])
+    if routing.get("run_id"):
+        evt["api_run_id"] = str(routing["run_id"])
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
