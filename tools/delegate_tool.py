@@ -2147,6 +2147,13 @@ def delegate_task(
         tasks = recovered_tasks
 
     if tasks and isinstance(tasks, list):
+        if background and len(tasks) > 1:
+            return tool_error(
+                "background=true is single-task only. Dispatch one background "
+                "subagent per delegate_task call (each returns its own handle and "
+                "re-enters the conversation independently), or run the batch "
+                "synchronously with background=false."
+            )
         if len(tasks) > max_children:
             return tool_error(
                 f"Too many tasks: {len(tasks)} provided, but "
@@ -2310,6 +2317,16 @@ def delegate_task(
                     },
                     ensure_ascii=False,
                 )
+            # Rejected (at capacity or schedule failure) — the async registry
+            # never owns the child in this branch, so mirror _run_single_child's
+            # lifecycle cleanup here before surfacing an error. Otherwise a
+            # capacity race can leave the constructed child detached from the
+            # parent but never run/closed.
+            try:
+                if hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug("Failed to close rejected async delegation child", exc_info=True)
             # Rejected (at capacity or schedule failure) — surface as a tool
             # error so the model can fall back to synchronous delegation.
             return tool_error(

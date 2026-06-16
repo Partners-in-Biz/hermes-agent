@@ -471,3 +471,81 @@ def test_gateway_cli_origin_event_left_unrouted():
     assert "platform" not in evt
 
 
+
+
+def test_delegate_task_background_rejects_json_string_batch_after_recovery(monkeypatch):
+    """Stringified tasks arrays must obey the same background single-task rule."""
+    import json
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess"
+
+    out = dt.delegate_task(
+        tasks=json.dumps([{"goal": "a"}, {"goal": "b"}]),
+        background=True,
+        parent_agent=parent,
+    )
+    parsed = json.loads(out)
+    assert "error" in parsed
+    assert "single-task only" in parsed["error"]
+
+
+def test_delegate_task_background_closes_child_when_dispatch_rejected(monkeypatch):
+    """A capacity/schedule rejection must not leak a constructed child."""
+    import json
+    from unittest.mock import MagicMock, patch
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess"
+    parent._active_children = []
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+    fake_child._subagent_id = "s1"
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+
+    with patch.object(dt, "_build_child_agent", return_value=fake_child), \
+         patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
+         patch("tools.async_delegation.dispatch_async_delegation", return_value={"status": "rejected", "error": "capacity reached"}):
+        out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
+
+    parsed = json.loads(out)
+    assert "error" in parsed
+    assert "capacity reached" in parsed["error"]
+    fake_child.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_async_delegation_watcher_defers_busy_session(monkeypatch):
+    """Gateway async completions must re-enter after the foreground turn, not steer/interrupt it."""
+    from gateway.run import GatewayRunner
+    from tools.process_registry import process_registry
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._running_agents = {"agent:main:telegram:dm:12345:678": object()}
+    injected = []
+
+    async def fake_inject(text, evt):
+        injected.append((text, evt))
+
+    runner._inject_watch_notification = fake_inject
+    evt = _make_async_evt()
+    process_registry.completion_queue.put(evt)
+
+    async def stop_after_first_sleep(_interval):
+        runner._running = False
+
+    monkeypatch.setattr("asyncio.sleep", stop_after_first_sleep)
+    await runner._async_delegation_watcher(interval=0)
+
+    assert injected == []
+    assert process_registry.completion_queue.qsize() == 1
+    assert process_registry.completion_queue.get_nowait()["delegation_id"] == "deleg_x1"

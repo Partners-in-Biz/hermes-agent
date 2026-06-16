@@ -12129,6 +12129,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pr.completion_queue.put(evt)
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
+                    session_key = str(evt.get("session_key") or "")
+                    if session_key and session_key in getattr(self, "_running_agents", {}):
+                        # Async completions are follow-up turns, not mid-turn
+                        # steering.  If the originating session is busy, put
+                        # the event back and let the normal post-turn/idle
+                        # drains inject it after the foreground turn clears.
+                        _pr.completion_queue.put(evt)
+                        continue
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue
