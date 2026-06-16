@@ -637,9 +637,11 @@ before continuing its own loop. Isolated context + terminal session.
   parallel, capped by `delegation.max_concurrent_children` (default 3).
 - **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator`
   (can spawn its own workers, bounded by `delegation.max_spawn_depth`).
-- **Not durable.** If the parent is interrupted, the child is
-  cancelled. For work that must outlive the turn, use `cronjob` or
-  `terminal(background=True, notify_on_complete=True)`.
+- **Synchronous by default.** With `background=false` or omitted, if the parent is interrupted, the child is
+  cancelled. For async delegation in runtimes that expose it, pass `background=true` on a single-task
+  `delegate_task` call: Hermes returns a `delegation_id` quickly, keeps the child running, and re-injects
+  the result into the conversation when it finishes. For durable scheduled work, use `cronjob`; for shell
+  processes, use `terminal(background=True, notify_on_complete=True)`.
 
 Config: `delegation.*` in `config.yaml`.
 
