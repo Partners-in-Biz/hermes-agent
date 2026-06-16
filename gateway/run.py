@@ -11993,9 +11993,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     run_status = run_statuses.get(session_key) or {}
                     api_session_id = str(run_status.get("session_id") or "").strip()
                     if api_session_id:
-                        evt.setdefault("api_run_id", session_key)
-                        evt.setdefault("api_session_id", api_session_id)
-                        evt.setdefault("session_id", api_session_id)
+                        evt["api_run_id"] = session_key
+                        evt["api_session_id"] = api_session_id
+                        evt["session_id"] = api_session_id
                         return SessionSource(
                             platform=Platform.API_SERVER,
                             chat_id=api_session_id,
@@ -12054,9 +12054,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         derived_platform = "api_server"
                         derived_chat_type = "dm"
                         derived_chat_id = api_session_id
-                        evt.setdefault("api_run_id", session_key)
-                        evt.setdefault("api_session_id", api_session_id)
-                        evt.setdefault("session_id", api_session_id)
+                        evt["api_run_id"] = session_key
+                        evt["api_session_id"] = api_session_id
+                        evt["session_id"] = api_session_id
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event API run lookup failed for %s: %s",

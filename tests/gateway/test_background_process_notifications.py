@@ -460,6 +460,8 @@ def test_build_process_event_source_prefers_api_run_status_over_stale_origin(
         "type": "async_delegation",
         "delegation_id": "deleg_x1",
         "session_key": "run_unparseable_123",
+        "api_session_id": "wrong_child_session",
+        "session_id": "wrong_child_session",
         "status": "completed",
     }
 
