@@ -412,6 +412,67 @@ def test_build_process_event_source_falls_back_to_session_key_chat_type(monkeypa
     assert source.user_name == "Emiliyan"
 
 
+def test_build_process_event_source_derives_api_run_source_from_adapter_status(
+    monkeypatch, tmp_path
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    api_adapter = SimpleNamespace(
+        _run_statuses={"run_unparseable_123": {"session_id": "api_session_abc"}},
+    )
+    runner.adapters[Platform.API_SERVER] = api_adapter
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_x1",
+        "session_key": "run_unparseable_123",
+        "status": "completed",
+    }
+
+    source = runner._build_process_event_source(evt)
+
+    assert source is not None
+    assert source.platform == Platform.API_SERVER
+    assert source.chat_id == "api_session_abc"
+    assert source.chat_type == "dm"
+    assert evt["api_run_id"] == "run_unparseable_123"
+    assert evt["api_session_id"] == "api_session_abc"
+
+
+
+def test_build_process_event_source_prefers_api_run_status_over_stale_origin(
+    monkeypatch, tmp_path
+):
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    api_adapter = SimpleNamespace(
+        _run_statuses={"run_unparseable_123": {"session_id": "api_parent_session"}},
+    )
+    runner.adapters[Platform.API_SERVER] = api_adapter
+    runner.session_store._entries["run_unparseable_123"] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.API_SERVER,
+            chat_id="wrong_child_session",
+            chat_type="dm",
+        )
+    )
+
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_x1",
+        "session_key": "run_unparseable_123",
+        "status": "completed",
+    }
+
+    source = runner._build_process_event_source(evt)
+
+    assert source is not None
+    assert source.platform == Platform.API_SERVER
+    assert source.chat_id == "api_parent_session"
+    assert evt["api_run_id"] == "run_unparseable_123"
+    assert evt["api_session_id"] == "api_parent_session"
+
+
+
 def test_build_process_event_source_uses_cached_live_source_before_session_key_parse(
     monkeypatch, tmp_path
 ):

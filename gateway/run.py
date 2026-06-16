@@ -11977,6 +11977,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         derived_chat_id = ""
 
         if session_key:
+            # API-server /v1/runs can use opaque run/session ids as the
+            # async-delegation session_key. Prefer the live run-status mapping
+            # over persisted/cached origins because a child subagent can create
+            # its own SessionSource while carrying the parent's opaque key.
+            try:
+                api_adapter = None
+                for p, a in getattr(self, "adapters", {}).items():
+                    p_value = getattr(p, "value", str(p))
+                    if p_value == "api_server":
+                        api_adapter = a
+                        break
+                if api_adapter is not None:
+                    run_statuses = getattr(api_adapter, "_run_statuses", {}) or {}
+                    run_status = run_statuses.get(session_key) or {}
+                    api_session_id = str(run_status.get("session_id") or "").strip()
+                    if api_session_id:
+                        evt.setdefault("api_run_id", session_key)
+                        evt.setdefault("api_session_id", api_session_id)
+                        evt.setdefault("session_id", api_session_id)
+                        return SessionSource(
+                            platform=Platform.API_SERVER,
+                            chat_id=api_session_id,
+                            chat_type="dm",
+                            thread_id=str(evt.get("thread_id") or "").strip() or None,
+                            user_id=str(evt.get("user_id") or "").strip() or None,
+                            user_name=str(evt.get("user_name") or "").strip() or None,
+                        )
+            except Exception as exc:
+                logger.debug(
+                    "Synthetic process-event API run lookup failed for %s: %s",
+                    session_key,
+                    exc,
+                )
+
             try:
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
@@ -11998,6 +12032,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 derived_platform = _parsed["platform"]
                 derived_chat_type = _parsed["chat_type"]
                 derived_chat_id = _parsed["chat_id"]
+
+        if session_key and not (evt.get("platform") or derived_platform):
+            # API-server /v1/runs often use opaque run/session ids as the
+            # async-delegation session_key (for example ``run_<uuid>``), so the
+            # normal ``agent:main:<platform>:...`` parser cannot recover the
+            # destination. Reconstruct it from the live API adapter's run
+            # status before deciding the notification is unroutable.
+            try:
+                api_adapter = None
+                for p, a in getattr(self, "adapters", {}).items():
+                    p_value = getattr(p, "value", str(p))
+                    if p_value == "api_server":
+                        api_adapter = a
+                        break
+                if api_adapter is not None:
+                    run_statuses = getattr(api_adapter, "_run_statuses", {}) or {}
+                    run_status = run_statuses.get(session_key) or {}
+                    api_session_id = str(run_status.get("session_id") or "").strip()
+                    if api_session_id:
+                        derived_platform = "api_server"
+                        derived_chat_type = "dm"
+                        derived_chat_id = api_session_id
+                        evt.setdefault("api_run_id", session_key)
+                        evt.setdefault("api_session_id", api_session_id)
+                        evt.setdefault("session_id", api_session_id)
+            except Exception as exc:
+                logger.debug(
+                    "Synthetic process-event API run lookup failed for %s: %s",
+                    session_key,
+                    exc,
+                )
 
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
