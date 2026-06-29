@@ -10,6 +10,7 @@ contract: when ``body`` is empty, fall back to ``response.text`` (parsing a JSON
 provider error. This is a diagnostic improvement and is platform-agnostic.
 """
 
+import json
 from types import SimpleNamespace
 
 from run_agent import AIAgent
@@ -48,9 +49,9 @@ def test_empty_body_fallback_redacts_secrets(monkeypatch):
     redactor — a proxy echoing an API key in the error must not leak it into
     final_response/logs (the empty-body path previously hid it as bare HTTP 400)."""
     monkeypatch.setenv("HERMES_REDACT_SECRETS", "true")
+    fake_secret = "sk-" + ("A" * 48)
     err = _make_empty_body_error(
-        '{"error": {"message": "bad key: sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef"}}'
+        json.dumps({"error": {"message": f"bad key: {fake_secret}"}})
     )
     summary = AIAgent._summarize_api_error(err)
-    assert "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef" not in summary
-
+    assert fake_secret not in summary
