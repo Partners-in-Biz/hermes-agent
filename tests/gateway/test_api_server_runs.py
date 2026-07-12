@@ -189,6 +189,129 @@ class TestStartRun:
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 assert resp.status == 202
+    @pytest.mark.asyncio
+    async def test_start_binds_working_directory_to_runtime_context(self, adapter, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        observed = {}
+        app = _create_runs_app(adapter)
+
+        def _run(**kwargs):
+            from agent.runtime_cwd import resolve_agent_cwd, resolve_context_cwd
+
+            observed["agent"] = resolve_agent_cwd()
+            observed["context"] = resolve_context_cwd()
+            return {"final_response": "done"}
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.side_effect = _run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "working_directory": str(workspace)},
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                status = {}
+                for _ in range(20):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["status"] == "completed"
+        assert observed == {"agent": workspace, "context": workspace}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("working_directory", ["", "relative/path", "missing-absolute"])
+    async def test_start_rejects_invalid_working_directory_before_queueing(
+        self, adapter, tmp_path, working_directory
+    ):
+        if working_directory == "missing-absolute":
+            working_directory = str(tmp_path / "does-not-exist")
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "working_directory": working_directory},
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert "working_directory" in data["error"]["message"]
+        mock_create.assert_not_called()
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_runs_keep_working_directories_isolated(self, adapter, tmp_path):
+        workspaces = [tmp_path / "one", tmp_path / "two"]
+        for workspace in workspaces:
+            workspace.mkdir()
+        barrier = threading.Barrier(2)
+        observed = {}
+
+        def _agent(label):
+            agent = MagicMock()
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+
+            def _run(**kwargs):
+                from agent.runtime_cwd import resolve_agent_cwd
+
+                before = resolve_agent_cwd()
+                barrier.wait(timeout=3)
+                after = resolve_agent_cwd()
+                observed[label] = (before, after)
+                return {"final_response": label}
+
+            agent.run_conversation.side_effect = _run
+            return agent
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=[_agent("one"), _agent("two")],
+            ):
+                responses = await asyncio.gather(
+                    *(
+                        cli.post(
+                            "/v1/runs",
+                            json={"input": workspace.name, "working_directory": str(workspace)},
+                        )
+                        for workspace in workspaces
+                    )
+                )
+                assert [response.status for response in responses] == [202, 202]
+                run_ids = [(await response.json())["run_id"] for response in responses]
+
+                statuses = []
+                for _ in range(40):
+                    statuses = [
+                        (await (await cli.get(f"/v1/runs/{run_id}")).json())["status"]
+                        for run_id in run_ids
+                    ]
+                    if statuses == ["completed", "completed"]:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert statuses == ["completed", "completed"]
+        assert observed == {
+            "one": (workspaces[0], workspaces[0]),
+            "two": (workspaces[1], workspaces[1]),
+        }
 
 
 # ---------------------------------------------------------------------------

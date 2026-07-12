@@ -4117,6 +4117,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        cwd: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -4140,6 +4141,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            cwd=cwd,
             async_delivery=False,
         )
 
@@ -4320,6 +4322,22 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
+        working_directory = ""
+        if "working_directory" in body:
+            raw_working_directory = body["working_directory"]
+            if not isinstance(raw_working_directory, str) or not raw_working_directory.strip():
+                return web.json_response(
+                    _openai_error("'working_directory' must be a non-empty absolute path to an existing directory"),
+                    status=400,
+                )
+            working_directory = raw_working_directory.strip()
+            working_directory_path = Path(working_directory)
+            if not working_directory_path.is_absolute() or not working_directory_path.is_dir():
+                return web.json_response(
+                    _openai_error("'working_directory' must be a non-empty absolute path to an existing directory"),
+                    status=400,
+                )
+
         raw_input = body.get("input")
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
@@ -4468,6 +4486,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 def _run_sync():
                     from gateway.session_context import clear_session_vars
+                    from tools.terminal_tool import (
+                        clear_task_env_overrides,
+                        register_task_env_overrides,
+                    )
                     from tools.approval import (
                         register_gateway_notify,
                         reset_current_session_key,
@@ -4478,6 +4500,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
+                    cwd_task_ids = []
                     try:
                         # Bind approval/session identity for this API run via
                         # contextvars so concurrent runs do not share process
@@ -4487,7 +4510,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             chat_id=session_id or run_id,
                             session_key=approval_session_key,
                             session_id=session_id or run_id,
+                            cwd=working_directory,
                         )
+                        if working_directory:
+                            cwd_task_ids = list(dict.fromkeys((effective_task_id, approval_session_key)))
+                            for cwd_task_id in cwd_task_ids:
+                                register_task_env_overrides(cwd_task_id, {"cwd": working_directory})
                         register_gateway_notify(approval_session_key, _approval_notify)
                         r = agent.run_conversation(
                             user_message=user_message,
@@ -4508,6 +4536,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                     clear_session_vars(session_tokens)
                                 except Exception:
                                     pass
+                            for cwd_task_id in cwd_task_ids:
+                                clear_task_env_overrides(cwd_task_id)
                     u = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
