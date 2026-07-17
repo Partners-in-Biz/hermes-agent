@@ -692,8 +692,11 @@ def test_delegate_task_background_accepts_json_string_batch_after_recovery(monke
         "model": "m", "provider": None, "base_url": None, "api_key": None,
         "api_mode": None, "command": None, "args": None,
     }
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
 
-    with patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
+    with patch.object(dt, "_build_child_agent", return_value=fake_child), \
+         patch.object(dt, "_resolve_delegation_credentials", return_value=creds), \
          patch("tools.async_delegation.dispatch_async_delegation_batch", return_value={"status": "dispatched", "delegation_id": "deleg_batch"}):
         out = dt.delegate_task(
             tasks=json.dumps([{"goal": "a"}, {"goal": "b"}]),

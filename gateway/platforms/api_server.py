@@ -4340,12 +4340,33 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             working_directory = raw_working_directory.strip()
-            working_directory_path = Path(working_directory)
+            working_directory_path = Path(working_directory).expanduser()
             if not working_directory_path.is_absolute() or not working_directory_path.is_dir():
                 return web.json_response(
                     _openai_error("'working_directory' must be a non-empty absolute path to an existing directory"),
                     status=400,
                 )
+            canonical_working_directory = working_directory_path.resolve()
+            if "working_directory_root" in body:
+                raw_working_directory_root = body["working_directory_root"]
+                if not isinstance(raw_working_directory_root, str) or not raw_working_directory_root.strip():
+                    return web.json_response(
+                        _openai_error("'working_directory_root' must contain the working directory"),
+                        status=400,
+                    )
+                working_directory_root = Path(raw_working_directory_root.strip()).expanduser()
+                if not working_directory_root.is_absolute() or not working_directory_root.is_dir():
+                    return web.json_response(
+                        _openai_error("'working_directory_root' must contain the working directory"),
+                        status=400,
+                    )
+                canonical_working_directory_root = working_directory_root.resolve()
+                if not canonical_working_directory.is_relative_to(canonical_working_directory_root):
+                    return web.json_response(
+                        _openai_error("'working_directory' must stay inside 'working_directory_root'"),
+                        status=400,
+                    )
+            working_directory = str(canonical_working_directory)
 
         raw_input = body.get("input")
         if not raw_input:

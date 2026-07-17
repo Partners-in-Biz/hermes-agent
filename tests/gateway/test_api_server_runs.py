@@ -231,6 +231,48 @@ class TestStartRun:
         assert observed == {"agent": workspace, "context": workspace}
 
     @pytest.mark.asyncio
+    async def test_start_expands_home_relative_working_directory_on_runtime(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        observed = {}
+        app = _create_runs_app(adapter)
+
+        def _run(**kwargs):
+            from agent.runtime_cwd import resolve_agent_cwd
+
+            observed["agent"] = resolve_agent_cwd()
+            return {"final_response": "done"}
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.side_effect = _run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "working_directory": "~/workspace"},
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                status = {}
+                for _ in range(20):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["status"] == "completed"
+        assert observed == {"agent": workspace}
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("working_directory", ["", "relative/path", "missing-absolute"])
     async def test_start_rejects_invalid_working_directory_before_queueing(
         self, adapter, tmp_path, working_directory
@@ -249,6 +291,34 @@ class TestStartRun:
 
         assert resp.status == 400
         assert "working_directory" in data["error"]["message"]
+        mock_create.assert_not_called()
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_working_directory_symlink_escape(
+        self, adapter, tmp_path
+    ):
+        root = tmp_path / "root"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        escaped = root / "escaped"
+        escaped.symlink_to(outside, target_is_directory=True)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "working_directory": str(escaped),
+                        "working_directory_root": str(root),
+                    },
+                )
+
+        assert resp.status == 400
         mock_create.assert_not_called()
         assert adapter._run_streams == {}
         assert adapter._run_statuses == {}
