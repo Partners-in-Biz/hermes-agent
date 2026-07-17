@@ -296,6 +296,34 @@ class TestStartRun:
         assert adapter._run_statuses == {}
 
     @pytest.mark.asyncio
+    async def test_start_rejects_working_directory_symlink_escape(
+        self, adapter, tmp_path
+    ):
+        root = tmp_path / "root"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        escaped = root / "escaped"
+        escaped.symlink_to(outside, target_is_directory=True)
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "working_directory": str(escaped),
+                        "working_directory_root": str(root),
+                    },
+                )
+
+        assert resp.status == 400
+        mock_create.assert_not_called()
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
     async def test_concurrent_runs_keep_working_directories_isolated(self, adapter, tmp_path):
         workspaces = [tmp_path / "one", tmp_path / "two"]
         for workspace in workspaces:
