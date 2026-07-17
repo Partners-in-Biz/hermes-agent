@@ -4340,12 +4340,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             working_directory = raw_working_directory.strip()
-            working_directory_path = Path(working_directory)
+            working_directory_path = Path(working_directory).expanduser()
             if not working_directory_path.is_absolute() or not working_directory_path.is_dir():
                 return web.json_response(
                     _openai_error("'working_directory' must be a non-empty absolute path to an existing directory"),
                     status=400,
                 )
+            working_directory = str(working_directory_path.resolve())
 
         raw_input = body.get("input")
         if not raw_input:
