@@ -209,6 +209,51 @@ class TestStartRun:
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 assert resp.status == 202
+
+    @pytest.mark.asyncio
+    async def test_start_forwards_allowlisted_model_and_reasoning_overrides(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "ok"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "model": "gpt-5.4",
+                        "reasoning_effort": "high",
+                    },
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                for _ in range(20):
+                    if run_id in adapter._run_statuses and mock_create.called:
+                        break
+                    await asyncio.sleep(0.05)
+
+        kwargs = mock_create.call_args.kwargs
+        assert kwargs["model_override"] == "gpt-5.4"
+        assert kwargs["reasoning_override"] is not None
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_non_allowlisted_direct_model(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "model": "untrusted/model"},
+                )
+
+        assert resp.status == 400
+        mock_create.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_start_binds_working_directory_to_runtime_context(self, adapter, tmp_path):
         workspace = tmp_path / "workspace"
