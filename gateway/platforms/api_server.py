@@ -95,11 +95,33 @@ from gateway.readiness import collect_runtime_readiness
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RUN_MODEL_ALLOWLIST = {
+    # Anthropic
     "claude-sonnet-4-6",
+    "claude-opus-4-6",
+    "claude-haiku-4-5",
+    # OpenAI Codex / ChatGPT
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
+    "gpt-5.3-codex",
     "gpt-5.3-codex-spark",
+    "gpt-5.2-codex",
+    # xAI Grok (API key + SuperGrok OAuth)
+    "grok-build-0.1",
+    "grok-4.5",
+    "grok-4.3",
+    "grok-composer-2.5-fast",
+    "grok-4.20-0309-reasoning",
+    "grok-4.20-0309-non-reasoning",
+    "grok-4.20-multi-agent-0309",
+    "grok-4.20-reasoning",  # legacy alias still present in some profile fallbacks
+    # Gemini
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview",
 }
 
 
@@ -1764,6 +1786,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         reasoning_override: Optional[Dict[str, Any]] = None,
         model_override: Optional[str] = None,
+        provider_override: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1858,7 +1881,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if model_override:
             model = model_override
-            self._apply_model_override_provider(runtime_kwargs, model_override)
+            self._apply_model_override_provider(runtime_kwargs, model_override, provider_override)
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -1901,12 +1924,23 @@ class APIServerAdapter(BasePlatformAdapter):
         lowered = model.strip().lower()
         if lowered.startswith("claude") or lowered.startswith("anthropic/claude"):
             return "anthropic"
+        if lowered.startswith("grok-") or lowered.startswith("x-ai/") or lowered.startswith("xai/"):
+            return "xai"
+        if lowered.startswith("gemini-") or lowered.startswith("google/gemini"):
+            return "gemini"
         if lowered.startswith("gpt-"):
             return "openai-codex"
+        if "/" in lowered:
+            return "openrouter"
         return None
 
-    def _apply_model_override_provider(self, runtime_kwargs: Dict[str, Any], model: str) -> None:
-        provider = self._infer_provider_for_model_override(model)
+    def _apply_model_override_provider(
+        self,
+        runtime_kwargs: Dict[str, Any],
+        model: str,
+        provider_override: Optional[str] = None,
+    ) -> None:
+        provider = (provider_override or "").strip() or self._infer_provider_for_model_override(model)
         if not provider or runtime_kwargs.get("provider") == provider:
             return
         try:
@@ -2066,6 +2100,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 "permission": [],
                 "root": route_cfg.get("model", alias),
                 "parent": model_name,
+                "provider": route_cfg.get("provider"),
+                "configured": True,
+                "available": True,
+            })
+
+        # Advertise allowlisted per-run override models so Messages can select
+        # Grok / Claude / Codex / Gemini without waiting on model_routes.
+        seen = {m["id"] for m in models}
+        for mid in sorted(self._run_model_allowlist()):
+            if mid in seen:
+                continue
+            provider = self._infer_provider_for_model_override(mid)
+            models.append({
+                "id": mid,
+                "object": "model",
+                "created": now,
+                "owned_by": provider or "hermes",
+                "permission": [],
+                "root": mid,
+                "parent": model_name,
+                "provider": provider,
+                "configured": True,
+                "available": True,
             })
 
         return web.json_response({"object": "list", "data": models})
@@ -5049,6 +5106,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         reasoning_override=reasoning_override,
                         model_override=model_override,
+                        provider_override=(
+                            body.get("provider").strip()
+                            if isinstance(body.get("provider"), str) and body.get("provider").strip()
+                            else None
+                        ),
                     )
                 self._active_run_agents[run_id] = agent
 
