@@ -2336,14 +2336,11 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_provider: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None,
-<<<<<<< HEAD
+session_model: Optional[str] = None,
+        confirmed_runtime_lock: bool = False,
         reasoning_override: Optional[Dict[str, Any]] = None,
         model_override: Optional[str] = None,
         provider_override: Optional[str] = None,
-=======
-        session_model: Optional[str] = None,
-        confirmed_runtime_lock: bool = False,
->>>>>>> upstream/main
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2389,11 +2386,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         from hermes_cli.tools_config import _get_platform_tools
 
-<<<<<<< HEAD
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-        reasoning_config = reasoning_override if reasoning_override is not None else GatewayRunner._load_reasoning_config()
-=======
-        # Catch RuntimeError ONLY around this call, not the wider
+# Catch RuntimeError ONLY around this call, not the wider
         # _create_agent()+run_conversation() span --
         # _resolve_runtime_agent_kwargs() is the sole raiser of
         # RuntimeError(format_runtime_provider_error(...)) for provider
@@ -2405,8 +2398,7 @@ class APIServerAdapter(BasePlatformAdapter):
             runtime_kwargs = _resolve_runtime_agent_kwargs()
         except RuntimeError as exc:
             raise _ProviderAuthResolutionError(str(exc)) from exc
-        reasoning_config = GatewayRunner._load_reasoning_config()
->>>>>>> upstream/main
+        reasoning_config = reasoning_override if reasoning_override is not None else GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
 
         # When the primary provider's auth fails (expired token / 429 quota
@@ -6396,24 +6388,19 @@ class APIServerAdapter(BasePlatformAdapter):
                             # environment state.
                             approval_token = set_current_session_key(approval_session_key)
                             session_tokens = self._bind_api_server_session(
-<<<<<<< HEAD
-                                chat_id=session_id or run_id,
-                                session_key=approval_session_key,
-                                session_id=session_id or run_id,
-                                cwd=working_directory,
-=======
-                                # chat_id carries the raw session id (the
+# chat_id carries the raw session id (the
                                 # X-Hermes-Session-Id equivalent) exactly like
                                 # the other agent-entry routes bind it via
                                 # _run_agent(). Without it,
                                 # tools.async_delegation reads an empty
                                 # HERMES_SESSION_CHAT_ID on /v1/runs and
                                 # background delegations stay forced-sync
-                                # (no wake target).
-                                chat_id=session_id or "",
+                                # (no wake target). Prefer run_id when the
+                                # request did not supply a session id.
+                                chat_id=session_id or run_id,
                                 session_key=approval_session_key,
-                                session_id=session_id or "",
->>>>>>> upstream/main
+                                session_id=session_id or run_id,
+                                cwd=working_directory,
                             )
                             if working_directory:
                                 cwd_task_ids = list(dict.fromkeys((effective_task_id, approval_session_key)))
