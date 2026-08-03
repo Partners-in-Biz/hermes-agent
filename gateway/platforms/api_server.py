@@ -52,6 +52,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -834,6 +835,112 @@ class ResponseStore:
         return row[0] if row else 0
 
 
+
+class RunStatusStore:
+    """SQLite-backed store for pollable /v1/runs status.
+
+    The API server keeps live agent/task/stream objects in memory, but the
+    externally visible run status must survive gateway restarts. Without this
+    store, clients that persisted a run_id would receive a misleading 404 after
+    a profile restart while the real outcome was an interrupted/lost run.
+    """
+
+    _ACTIVE_STATUSES = frozenset({"queued", "running", "waiting_for_approval", "stopping"})
+
+    def __init__(self, db_path: str = None, max_size: int = 1000):
+        self._max_size = max_size
+        self._lock = threading.RLock()
+        if db_path is None:
+            try:
+                from hermes_cli.config import get_hermes_home
+
+                db_path = str(get_hermes_home() / "run_status_store.db")
+            except Exception:
+                db_path = ":memory:"
+        try:
+            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        except Exception:
+            self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+        try:
+            from hermes_state import apply_wal_with_fallback
+
+            apply_wal_with_fallback(self._conn, db_label="run_status_store.db")
+        except Exception:
+            pass
+        with self._lock:
+            self._conn.execute(
+                """CREATE TABLE IF NOT EXISTS run_statuses (
+                    run_id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )"""
+            )
+            self._conn.commit()
+
+    def load_all(self) -> Dict[str, Dict[str, Any]]:
+        """Load persisted run statuses into the adapter's in-memory cache."""
+        with self._lock:
+            rows = self._conn.execute("SELECT run_id, data FROM run_statuses").fetchall()
+        statuses: Dict[str, Dict[str, Any]] = {}
+        for run_id, raw in rows:
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                statuses[str(run_id)] = data
+        return statuses
+
+    def put(self, run_id: str, data: Dict[str, Any]) -> None:
+        payload = json.dumps(data, default=str)
+        updated_at = float(data.get("updated_at", time.time()) or time.time())
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO run_statuses (run_id, data, updated_at) VALUES (?, ?, ?)",
+                (run_id, payload, updated_at),
+            )
+            count = self._conn.execute("SELECT COUNT(*) FROM run_statuses").fetchone()[0]
+            if count > self._max_size:
+                self._conn.execute(
+                    "DELETE FROM run_statuses WHERE run_id IN ("
+                    "SELECT run_id FROM run_statuses ORDER BY updated_at ASC LIMIT ?"
+                    ")",
+                    (count - self._max_size,),
+                )
+            self._conn.commit()
+
+    def delete(self, run_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM run_statuses WHERE run_id = ?", (run_id,))
+            self._conn.commit()
+
+    def mark_active_interrupted(self, *, reason: str) -> Dict[str, Dict[str, Any]]:
+        """Mark persisted non-terminal runs interrupted after a gateway restart."""
+        now = time.time()
+        statuses = self.load_all()
+        for run_id, data in list(statuses.items()):
+            if data.get("status") not in self._ACTIVE_STATUSES:
+                continue
+            data.update({
+                "object": "hermes.run",
+                "run_id": run_id,
+                "status": "interrupted",
+                "updated_at": now,
+                "error": reason,
+                "last_event": "run.interrupted",
+            })
+            self.put(run_id, data)
+            statuses[run_id] = data
+        return statuses
+
+    def close(self) -> None:
+        try:
+            with self._lock:
+                self._conn.close()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # CORS middleware
 # ---------------------------------------------------------------------------
@@ -1265,6 +1372,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        self._run_status_store = RunStatusStore(db_path=extra.get("run_status_db_path"))
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1277,7 +1385,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
-        self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # Persist across planned profile restarts so clients never see a false 404
+        # for a run that was interrupted mid-flight.
+        self._run_statuses: Dict[str, Dict[str, Any]] = self._run_status_store.mark_active_interrupted(
+            reason="Gateway restarted before this run reached a terminal state"
+        )
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -6136,6 +6248,10 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        try:
+            self._run_status_store.put(run_id, current)
+        except Exception:
+            logger.debug("[api_server] failed to persist status for run %s", run_id, exc_info=True)
         return current
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
@@ -6932,11 +7048,15 @@ class APIServerAdapter(BasePlatformAdapter):
         stale_statuses = [
             run_id
             for run_id, status in list(self._run_statuses.items())
-            if status.get("status") in {"completed", "failed", "cancelled"}
+            if status.get("status") in {"completed", "failed", "cancelled", "interrupted"}
             and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            try:
+                self._run_status_store.delete(run_id)
+            except Exception:
+                logger.debug("[api_server] failed to delete persisted status for run %s", run_id, exc_info=True)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -7151,12 +7271,32 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
+        # Mark live runs interrupted before tearing down the HTTP surface so
+        # pollers observe a terminal status instead of a false run_not_found.
+        try:
+            for run_id, status in list(self._run_statuses.items()):
+                if status.get("status") in RunStatusStore._ACTIVE_STATUSES:
+                    self._set_run_status(
+                        run_id,
+                        "interrupted",
+                        error="Gateway disconnected before this run reached a terminal state",
+                        last_event="run.interrupted",
+                    )
+        except Exception:
+            logger.debug("[api_server] failed to mark active runs interrupted on disconnect", exc_info=True)
         if self._response_store is not None:
             try:
                 self._response_store.close()
             except Exception:
                 logger.debug(
                     "Failed to close response store for %s", self.name, exc_info=True,
+                )
+        if getattr(self, "_run_status_store", None) is not None:
+            try:
+                self._run_status_store.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close run status store for %s", self.name, exc_info=True,
                 )
         if self._site:
             await self._site.stop()
