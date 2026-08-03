@@ -4419,13 +4419,18 @@ def _pool_codex_access_token() -> str:
 # =============================================================================
 
 def _xai_oauth_state_from_store(auth_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return usable xAI OAuth state from provider state or credential pool."""
+    """Return usable xAI OAuth state from provider state or credential pool.
+
+    Access-only credentials are valid for multi-device managed delivery
+    (Partners in Biz / similar): the control plane owns the rotating
+    refresh_token and pushes short-lived access tokens to runtimes. A
+    missing refresh_token must not make a still-valid access JWT unusable.
+    """
     state = _load_provider_state(auth_store, "xai-oauth")
     tokens = state.get("tokens") if isinstance(state, dict) else None
     if isinstance(tokens, dict):
         access_token = str(tokens.get("access_token", "") or "").strip()
-        refresh_token = str(tokens.get("refresh_token", "") or "").strip()
-        if access_token and refresh_token:
+        if access_token:
             return state
 
     credential_pool = auth_store.get("credential_pool")
@@ -4439,29 +4444,36 @@ def _xai_oauth_state_from_store(auth_store: Dict[str, Any]) -> Optional[Dict[str
             if not isinstance(entry, dict):
                 continue
             access_token = str(entry.get("access_token", "") or "").strip()
-            refresh_token = str(entry.get("refresh_token", "") or "").strip()
-            if not access_token or not refresh_token:
+            if not access_token:
                 continue
+            refresh_token = str(entry.get("refresh_token", "") or "").strip()
             merged = dict(state or {})
-            merged["tokens"] = {
+            merged_tokens = {
                 "access_token": access_token,
-                "refresh_token": refresh_token,
                 "token_type": str(entry.get("token_type") or "Bearer"),
             }
+            if refresh_token:
+                merged_tokens["refresh_token"] = refresh_token
+            merged["tokens"] = merged_tokens
             if entry.get("last_refresh"):
                 merged["last_refresh"] = entry.get("last_refresh")
-            merged.setdefault("auth_mode", "oauth_pkce")
+            merged.setdefault("auth_mode", "oauth_device_code")
             return merged
 
     return state if isinstance(state, dict) else None
 
 
 def _xai_oauth_state_has_usable_tokens(state: Optional[Dict[str, Any]]) -> bool:
+    """True when state carries a non-empty access_token.
+
+    Refresh is optional: managed multi-device deployments deliver access-only
+    tokens and refresh centrally. Expired access without refresh is rejected
+    later by :func:`resolve_xai_oauth_runtime_credentials`.
+    """
     tokens = state.get("tokens") if isinstance(state, dict) else None
     return (
         isinstance(tokens, dict)
         and bool(str(tokens.get("access_token", "") or "").strip())
-        and bool(str(tokens.get("refresh_token", "") or "").strip())
     )
 
 
@@ -4492,7 +4504,6 @@ def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
             relogin_required=True,
         )
     access_token = str(tokens.get("access_token", "") or "").strip()
-    refresh_token = str(tokens.get("refresh_token", "") or "").strip()
     if not access_token:
         raise AuthError(
             "xAI OAuth state is missing access_token. Re-authenticate with `hermes model`.",
@@ -4500,13 +4511,9 @@ def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
             code="xai_auth_missing_access_token",
             relogin_required=True,
         )
-    if not refresh_token:
-        raise AuthError(
-            "xAI OAuth state is missing refresh_token. Re-authenticate with `hermes model`.",
-            provider="xai-oauth",
-            code="xai_auth_missing_refresh_token",
-            relogin_required=True,
-        )
+    # refresh_token is optional for managed access-only delivery. Local CLI
+    # logins still store one; resolve/refresh paths require it only when the
+    # access token actually needs rotation.
     return {
         "tokens": tokens,
         "last_refresh": state.get("last_refresh"),
@@ -5010,43 +5017,64 @@ def resolve_xai_oauth_runtime_credentials(
             if (not should_refresh) and refresh_if_expiring:
                 should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
             if should_refresh:
-                if not token_endpoint:
-                    token_endpoint = _xai_oauth_discovery(refresh_timeout_seconds)["token_endpoint"]
-                try:
-                    tokens = _refresh_xai_oauth_tokens(
-                        tokens,
-                        token_endpoint=token_endpoint,
-                        redirect_uri=redirect_uri,
-                        timeout_seconds=refresh_timeout_seconds,
+                refresh_token = str(tokens.get("refresh_token", "") or "").strip()
+                if not refresh_token:
+                    # Managed multi-device access-only credentials cannot self-
+                    # refresh. Keep serving a still-valid access JWT; only fail
+                    # once it is actually expired (or force_refresh was asked).
+                    access_still_valid = not _xai_access_token_is_expiring(
+                        access_token, skew_seconds=0
                     )
-                    access_token = str(tokens.get("access_token", "") or "").strip()
-                except AuthError as exc:
-                    if _is_terminal_xai_oauth_refresh_error(exc):
-                        # Terminal failure (HTTP 400/401/403 — invalid_grant, token revoked).
-                        # Clear dead tokens from auth.json so subsequent sessions fail fast
-                        # without a network retry. Mirrors credential_pool.py quarantine.
-                        try:
-                            _q_store = _load_auth_store()
-                            _q_state = _load_provider_state(_q_store, "xai-oauth") or {}
-                            _q_tokens = dict(_q_state.get("tokens") or {})
-                            _q_tokens.pop("access_token", None)
-                            _q_tokens.pop("refresh_token", None)
-                            _q_state["tokens"] = _q_tokens
-                            _q_state["last_auth_error"] = {
-                                "provider": "xai-oauth",
-                                "code": exc.code or "xai_refresh_failed",
-                                "message": str(exc),
-                                "reason": "runtime_refresh_failure",
-                                "relogin_required": True,
-                                "at": datetime.now(timezone.utc).isoformat(),
-                            }
-                            _store_provider_state(_q_store, "xai-oauth", _q_state, set_active=False)
-                            _save_auth_store(_q_store)
-                        except Exception as _save_exc:
-                            logger.debug(
-                                "xAI OAuth: failed to persist quarantined state: %s", _save_exc,
-                            )
-                    raise
+                    if force_refresh or not access_still_valid:
+                        raise AuthError(
+                            "xAI OAuth access token expired and this runtime has no "
+                            "refresh_token (managed multi-device delivery). Wait for "
+                            "Partners in Biz / the credential control plane to push a "
+                            "fresh access token, or re-sync SuperGrok in Settings.",
+                            provider="xai-oauth",
+                            code="xai_auth_access_expired_no_refresh",
+                            relogin_required=False,
+                        )
+                    # Access JWT still valid inside proactive skew — use as-is.
+                    should_refresh = False
+                if should_refresh:
+                    if not token_endpoint:
+                        token_endpoint = _xai_oauth_discovery(refresh_timeout_seconds)["token_endpoint"]
+                    try:
+                        tokens = _refresh_xai_oauth_tokens(
+                            tokens,
+                            token_endpoint=token_endpoint,
+                            redirect_uri=redirect_uri,
+                            timeout_seconds=refresh_timeout_seconds,
+                        )
+                        access_token = str(tokens.get("access_token", "") or "").strip()
+                    except AuthError as exc:
+                        if _is_terminal_xai_oauth_refresh_error(exc):
+                            # Terminal failure (HTTP 400/401/403 — invalid_grant, token revoked).
+                            # Clear dead tokens from auth.json so subsequent sessions fail fast
+                            # without a network retry. Mirrors credential_pool.py quarantine.
+                            try:
+                                _q_store = _load_auth_store()
+                                _q_state = _load_provider_state(_q_store, "xai-oauth") or {}
+                                _q_tokens = dict(_q_state.get("tokens") or {})
+                                _q_tokens.pop("access_token", None)
+                                _q_tokens.pop("refresh_token", None)
+                                _q_state["tokens"] = _q_tokens
+                                _q_state["last_auth_error"] = {
+                                    "provider": "xai-oauth",
+                                    "code": exc.code or "xai_refresh_failed",
+                                    "message": str(exc),
+                                    "reason": "runtime_refresh_failure",
+                                    "relogin_required": True,
+                                    "at": datetime.now(timezone.utc).isoformat(),
+                                }
+                                _store_provider_state(_q_store, "xai-oauth", _q_state, set_active=False)
+                                _save_auth_store(_q_store)
+                            except Exception as _save_exc:
+                                logger.debug(
+                                    "xAI OAuth: failed to persist quarantined state: %s", _save_exc,
+                                )
+                        raise
 
     base_url = _xai_validate_inference_base_url(
         os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
