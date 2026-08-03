@@ -898,6 +898,7 @@ class CredentialPool:
             if store_access and (
                 store_access != entry_access
                 or (store_refresh and store_refresh != entry_refresh)
+                or (not store_refresh and entry_refresh)
             ):
                 logger.debug(
                     "Pool entry %s: syncing xAI OAuth tokens from auth.json "
@@ -906,7 +907,10 @@ class CredentialPool:
                 )
                 field_updates: Dict[str, Any] = {
                     "access_token": store_access,
-                    "refresh_token": store_refresh or entry.refresh_token,
+                    # Empty store refresh means managed access-only delivery —
+                    # drop any stale local refresh_token so we never burn a
+                    # rotated single-use grant that the control plane owns.
+                    "refresh_token": store_refresh or None,
                     "last_status": None,
                     "last_status_at": None,
                     "last_error_code": None,
@@ -1182,6 +1186,16 @@ class CredentialPool:
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
+                return None
+            # Managed multi-device xAI OAuth can be access-only. Keep leasing the
+            # entry while the access JWT is still valid instead of dropping it
+            # from rotation when proactive refresh skew fires.
+            if (
+                self.provider == "xai-oauth"
+                and entry.access_token
+                and not auth_mod._xai_access_token_is_expiring(entry.access_token, 0)
+            ):
+                return entry
             return None
 
         # Codex and xAI OAuth refresh tokens are single-use.  The
