@@ -3355,6 +3355,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _get_effective_configurable_toolsets,
                 _get_platform_tools,
                 _toolset_has_keys,
+                get_nous_subscription_features,
             )
             from toolsets import resolve_toolset
 
@@ -3364,6 +3365,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "api_server",
                 include_default_mcp_servers=False,
             )
+            features = get_nous_subscription_features(config)
             data: List[Dict[str, Any]] = []
             for name, label, desc in _get_effective_configurable_toolsets():
                 try:
@@ -3376,7 +3378,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "label": label,
                     "description": desc,
                     "enabled": is_enabled,
-                    "configured": _toolset_has_keys(name, config),
+                    "configured": _toolset_has_keys(name, config, features=features),
                     "tools": tools,
                 })
         except Exception:
