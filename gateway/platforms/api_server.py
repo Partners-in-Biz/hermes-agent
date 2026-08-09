@@ -2799,7 +2799,6 @@ class APIServerAdapter(BasePlatformAdapter):
             runtime_kwargs = _resolve_runtime_agent_kwargs()
         except RuntimeError as exc:
             raise _ProviderAuthResolutionError(str(exc)) from exc
-        reasoning_config = reasoning_override if reasoning_override is not None else GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
 
         # When the primary provider's auth fails (expired token / 429 quota
@@ -2815,8 +2814,6 @@ class APIServerAdapter(BasePlatformAdapter):
             model = runtime_model
 
         request_reasoning_config = _request_reasoning_config(model_options)
-        if request_reasoning_config is not None:
-            reasoning_config = request_reasoning_config
         request_service_tier = _request_service_tier(model_options)
 
         request_model = _clean_request_string(requested_model)
@@ -3023,6 +3020,25 @@ class APIServerAdapter(BasePlatformAdapter):
             None
             if confirmed_runtime_lock
             else GatewayRunner._load_fallback_model()
+        )
+
+        # Resolve reasoning against the model this request will actually
+        # run. Per-model ``agent.reasoning_overrides`` key off that model,
+        # and it is only settled after the precedence chain above (browser
+        # lock -> session /model -> session row -> route -> per-request ->
+        # defaults). Resolving at function entry keyed them off
+        # ``model.default`` instead — the defect e81d18dfb removed from the
+        # native gateway paths. An explicit per-request reasoning parameter
+        # (PiB ``reasoning_override`` from the /v1/responses body) still
+        # wins over request model_options and config.
+        reasoning_config = (
+            reasoning_override
+            if reasoning_override is not None
+            else (
+                request_reasoning_config
+                if request_reasoning_config is not None
+                else GatewayRunner._load_reasoning_config(model)
+            )
         )
 
         agent_kwargs = {
@@ -3800,11 +3816,52 @@ class APIServerAdapter(BasePlatformAdapter):
             return err
         db = await self._ensure_session_db_async()
         resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
-        messages = await asyncio.to_thread(db.get_messages, resolved_id)
+        raw_limit = request.query.get("limit")
+        raw_offset = request.query.get("offset", "0")
+        order = request.query.get("order")
+        if order not in (None, "oldest", "latest"):
+            return web.json_response(
+                _openai_error(
+                    "order must be one of: oldest, latest",
+                    code="invalid_pagination",
+                ),
+                status=400,
+            )
+        try:
+            offset = int(raw_offset)
+            requested_limit = None if raw_limit is None else int(raw_limit)
+        except (TypeError, ValueError):
+            offset = -1
+            requested_limit = -1
+        if offset < 0 or (requested_limit is not None and requested_limit < 0):
+            return web.json_response(
+                _openai_error(
+                    "limit and offset must be non-negative integers",
+                    code="invalid_pagination",
+                ),
+                status=400,
+            )
+
+        default_page = requested_limit is None
+        latest_page = order == "latest" or (order is None and default_page)
+        limit = 500 if default_page else min(requested_limit, 500)
+        messages = await asyncio.to_thread(
+            db.get_messages,
+            resolved_id,
+            limit=limit,
+            offset=offset,
+            latest=latest_page,
+        )
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "order": order or ("latest" if default_page else "oldest"),
+                "returned": len(messages),
+            },
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
@@ -6200,14 +6257,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 for tc in msg["tool_calls"]:
                     func = tc.get("function", {})
                     items.append({
+                        "id": f"fc_{uuid.uuid4().hex[:24]}",
                         "type": "function_call",
+                        # These calls were already executed server-side by the
+                        # Hermes agent; they are replayed for structured tool
+                        # UI only.  Mark them completed (matching the SSE
+                        # streaming path) so OpenAI clients don't interpret
+                        # them as pending calls the client must execute.
+                        "status": "completed",
                         "name": func.get("name", ""),
                         "arguments": func.get("arguments", ""),
                         "call_id": tc.get("id", ""),
                     })
             elif role == "tool":
                 items.append({
+                    "id": f"fco_{uuid.uuid4().hex[:24]}",
                     "type": "function_call_output",
+                    "status": "completed",
                     "call_id": msg.get("tool_call_id", ""),
                     "output": msg.get("content", ""),
                 })
