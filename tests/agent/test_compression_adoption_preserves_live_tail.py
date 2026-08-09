@@ -138,9 +138,9 @@ def test_adoption_fails_closed_when_live_tail_preflush_does_not_succeed(
     _assert_failed_preflush_leaves_parent_live(db, agent, messages, parent_id)
 
 
-@pytest.mark.parametrize("invalid_boundary", [None, -1, 4])
+@pytest.mark.parametrize("invalid_boundary", [None, -1, 4, True, False])
 def test_adoption_fails_closed_when_live_tail_boundary_is_unknown(
-    invalid_boundary: int | None, tmp_path: Path
+    invalid_boundary: object, tmp_path: Path
 ) -> None:
     """Unknown boundary is never evidence that a live tail is safe to drop."""
     db = SessionDB(db_path=tmp_path / "state.db")
