@@ -190,6 +190,69 @@ class TestStartRun:
             "runs route must bind chat_id so delegation dispatch sees a wake target"
         )
 
+    @pytest.mark.asyncio
+    async def test_same_session_runs_are_queued_until_prior_turn_finishes(self, adapter):
+        """Retries/double-submits for one session must never overlap turns."""
+        app = _create_runs_app(adapter)
+        first_started = threading.Event()
+        release_first = threading.Event()
+        call_order = []
+
+        first_agent = MagicMock()
+        second_agent = MagicMock()
+        for agent in (first_agent, second_agent):
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+
+        def _first_run(**_kwargs):
+            call_order.append("first")
+            first_started.set()
+            assert release_first.wait(timeout=5), "test did not release first turn"
+            return {"final_response": "first complete"}
+
+        def _second_run(**_kwargs):
+            call_order.append("second")
+            return {"final_response": "second complete"}
+
+        first_agent.run_conversation.side_effect = _first_run
+        second_agent.run_conversation.side_effect = _second_run
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=[first_agent, second_agent],
+            ):
+                first = await cli.post(
+                    "/v1/runs", json={"input": "first", "session_id": "shared"}
+                )
+                first_id = (await first.json())["run_id"]
+                for _ in range(40):
+                    if first_started.is_set():
+                        break
+                    await asyncio.sleep(0.025)
+                assert first_started.is_set()
+
+                second = await cli.post(
+                    "/v1/runs", json={"input": "second", "session_id": "shared"}
+                )
+                second_id = (await second.json())["run_id"]
+                await asyncio.sleep(0.1)
+                assert call_order == ["first"]
+                assert adapter._run_statuses[second_id]["status"] == "queued"
+
+                release_first.set()
+                for _ in range(80):
+                    if adapter._run_statuses.get(second_id, {}).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.025)
+
+        assert adapter._run_statuses[first_id]["status"] == "completed"
+        assert adapter._run_statuses[second_id]["status"] == "completed"
+        assert call_order == ["first", "second"]
+        assert adapter._session_run_locks == {}
+
 
     @pytest.mark.asyncio
     async def test_start_rejects_conflicting_route_and_request_provider(self):

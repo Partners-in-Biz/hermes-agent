@@ -1427,6 +1427,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # /v1/runs can receive retries or double-submits for the same durable
+        # session.  Running those turns concurrently corrupts history and can
+        # race the session-compression lease, so serialize only equal session
+        # ids while preserving concurrency across independent sessions.
+        self._session_run_locks: Dict[str, "asyncio.Lock"] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
@@ -6588,9 +6593,19 @@ class APIServerAdapter(BasePlatformAdapter):
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        session_run_lock = self._session_run_locks.get(session_id)
+        if session_run_lock is None:
+            session_run_lock = asyncio.Lock()
+            self._session_run_locks[session_id] = session_run_lock
 
         async def _run_and_close():
+            session_lock_acquired = False
             try:
+                # Keep the public status at queued until this session's prior
+                # turn has completed its durable transcript work.  Do not hold
+                # a global lock: other conversations can continue normally.
+                await session_run_lock.acquire()
+                session_lock_acquired = True
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
@@ -6839,6 +6854,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                if session_lock_acquired:
+                    session_run_lock.release()
+                    # The event loop cannot interleave between release and
+                    # this cleanup, so removing only an unlocked lock cannot
+                    # strand a newly queued run.  Bound this cache for the
+                    # common one-shot-session case.
+                    if (
+                        not session_run_lock.locked()
+                        and not getattr(session_run_lock, "_waiters", None)
+                        and self._session_run_locks.get(session_id)
+                        is session_run_lock
+                    ):
+                        self._session_run_locks.pop(session_id, None)
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
