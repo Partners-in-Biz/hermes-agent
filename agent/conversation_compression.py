@@ -2756,7 +2756,7 @@ def compress_context(
                     # discard.
                     preflush_index = getattr(agent, "_persist_user_message_idx", None)
                     has_live_tail = (
-                        isinstance(preflush_index, int)
+                        type(preflush_index) is int
                         and 0 <= preflush_index < len(messages)
                     )
                     # A missing boundary is normal for a cold stale snapshot.
@@ -2789,7 +2789,7 @@ def compress_context(
                         return True
 
                     known_empty_tail = (
-                        isinstance(preflush_index, int)
+                        type(preflush_index) is int
                         and preflush_index == len(messages)
                     ) or (
                         preflush_index is None and _durable_covers_snapshot()
