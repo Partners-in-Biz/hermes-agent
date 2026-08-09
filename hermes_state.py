@@ -7354,15 +7354,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (this guard has already needed targeted fixes — see the #74478
         patience note below).
         """
+        now = time.time()
         active_lock = conn.execute(
             "SELECT holder FROM compression_locks "
             "WHERE session_id = ? AND expires_at > ?",
-            (session_id, time.time()),
+            (session_id, now),
         ).fetchone()
-        if (
-            active_lock is not None
-            and active_lock["holder"] != compression_lock_holder
-        ):
+        if compression_lock_holder is not None:
+            # Lease-qualified compressor writes must prove that the exact holder
+            # is still live inside this transaction. A missing/expired row is a
+            # lost lease, not an invitation for a stale compressor to append.
+            if (
+                active_lock is None
+                or active_lock["holder"] != compression_lock_holder
+            ):
+                raise CompressionSessionBusyError(
+                    f"Compression lease lost before transcript append: {session_id}"
+                )
+        elif active_lock is not None:
+            # An ordinary turn writer can safely wait for the current healthy
+            # compressor to finish; _execute_write gives this subclass a bounded
+            # contention retry budget.
             raise SessionCompressionInProgressError(
                 f"Session {session_id!r} is being compressed by another writer"
             )

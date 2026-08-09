@@ -127,3 +127,52 @@ def test_a_lost_compression_lease_still_fails_fast(db: SessionDB) -> None:
     assert time.monotonic() - started < 0.5, (
         "a lost lease is permanent and must not spend the retry budget"
     )
+
+
+def test_expired_owner_cannot_append_under_a_stale_compression_holder(
+    db: SessionDB,
+) -> None:
+    """A lease-qualified append requires a live owner inside its write txn."""
+    assert db.try_acquire_compression_lock("sess1", "compressor", ttl_seconds=0.01)
+    time.sleep(0.03)
+
+    with pytest.raises(CompressionSessionBusyError):
+        db.append_message(
+            "sess1",
+            role="user",
+            content="must not land after lease expiry",
+            compression_lock_holder="compressor",
+        )
+
+    assert not any(
+        row["content"] == "must not land after lease expiry"
+        for row in db.get_messages("sess1")
+    )
+
+
+def test_replaced_owner_fails_fast_instead_of_waiting_to_append(
+    db: SessionDB, monkeypatch
+) -> None:
+    """A stale holder is permanent, unlike an ordinary writer collision."""
+    monkeypatch.setattr(SessionDB, "_COMPRESSION_BUSY_WAIT_S", 0.5)
+    assert db.try_acquire_compression_lock("sess1", "old-owner", ttl_seconds=0.01)
+    time.sleep(0.03)
+    assert db.try_acquire_compression_lock("sess1", "new-owner", ttl_seconds=60)
+
+    started = time.monotonic()
+    with pytest.raises(CompressionSessionBusyError):
+        db.append_message(
+            "sess1",
+            role="user",
+            content="must not land under old owner",
+            compression_lock_holder="old-owner",
+        )
+
+    assert time.monotonic() - started < 0.2, (
+        "a stale compression owner must fail immediately, not consume the "
+        "ordinary-writer contention budget"
+    )
+    assert not any(
+        row["content"] == "must not land under old owner"
+        for row in db.get_messages("sess1")
+    )

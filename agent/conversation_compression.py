@@ -2749,58 +2749,98 @@ def compress_context(
             if callable(durable_loader):
                 durable_parent = durable_loader(_lock_db, _lock_sid)
                 if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
-                    # The in-memory transcript carries the CURRENT turn's
-                    # un-persisted user tail (anchored by
-                    # _persist_user_message_idx) that the durable snapshot read
-                    # above does not contain yet. Flush that tail through the
-                    # normal rotation-boundary path (conversation_history = the
-                    # already-durable prefix, #68196 boundary) BEFORE adopting,
-                    # then re-read the durable parent so the adopted snapshot
-                    # includes the live input. If the flush fails (or the
-                    # anchor is unknown), skip adoption entirely: replacing
-                    # the in-memory transcript with a snapshot that lacks the
-                    # user's input would silently drop it from the summarized
-                    # and rotated history (#adopt-live-tail).
-                    _preflush_idx = getattr(agent, "_persist_user_message_idx", None)
-                    _preflush_ok = False
-                    if (
-                        isinstance(_preflush_idx, int)
-                        and 0 <= _preflush_idx < len(messages)
-                    ):
+                    # The in-memory transcript may carry this turn's user tail
+                    # outside state.db. Only a positively known empty tail can
+                    # adopt the newer durable parent directly; an absent or
+                    # invalid boundary is not evidence that input is safe to
+                    # discard.
+                    preflush_index = getattr(agent, "_persist_user_message_idx", None)
+                    has_live_tail = (
+                        type(preflush_index) is int
+                        and 0 <= preflush_index < len(messages)
+                    )
+
+                    # A missing boundary is normal for a cold stale snapshot.
+                    # It can adopt only when the durable parent already covers
+                    # every caller message in the same order. Any divergence
+                    # means local state may be a live tail, so it must abort.
+                    def _durable_covers_snapshot() -> bool:
+                        if len(durable_parent) < len(messages):
+                            return False
+                        ignored_keys = {"timestamp", "_db_persisted"}
+                        for durable_message, snapshot_message in zip(
+                            durable_parent, messages
+                        ):
+                            if not isinstance(durable_message, dict) or not isinstance(
+                                snapshot_message, dict
+                            ):
+                                return False
+                            durable_value = {
+                                key: value
+                                for key, value in durable_message.items()
+                                if key not in ignored_keys
+                            }
+                            snapshot_value = {
+                                key: value
+                                for key, value in snapshot_message.items()
+                                if key not in ignored_keys
+                            }
+                            if durable_value != snapshot_value:
+                                return False
+                        return True
+
+                    known_empty_tail = (
+                        type(preflush_index) is int
+                        and preflush_index == len(messages)
+                    ) or (
+                        preflush_index is None and _durable_covers_snapshot()
+                    )
+                    preflush_ok = known_empty_tail
+                    failure_class = "live_tail_boundary_unknown"
+                    if has_live_tail:
                         try:
-                            _preflush_ok = agent._flush_messages_to_session_db(
-                                messages,
-                                conversation_history=messages[:_preflush_idx],
+                            # The active compressor holder is forwarded to the
+                            # atomic append guard. A valid holder is admitted;
+                            # a lost or exhausted lease is rejected fail-closed.
+                            preflush_ok = bool(
+                                agent._flush_messages_to_session_db(
+                                    messages,
+                                    conversation_history=messages[:preflush_index],
+                                )
                             )
                         except Exception:
-                            _preflush_ok = False
-                    else:
-                        # No known un-persisted tail (anchor unset or already
-                        # at the end of the snapshot): the in-memory transcript
-                        # is fully durable, so adopting the longer parent
-                        # cannot drop live input — keep the legacy
-                        # adopt-directly behavior for that shape
-                        # (test_compression_concurrent_fork).
-                        _preflush_ok = True
-                    if not _preflush_ok:
+                            preflush_ok = False
+                        failure_class = "live_tail_persistence_failed"
+
+                    if not preflush_ok:
                         logger.warning(
                             "compression: session=%s grew before lease "
-                            "(%d → %d msgs) but the pre-adoption flush of the "
-                            "live tail failed; skipping durable-snapshot "
-                            "adoption so un-persisted user input is kept",
+                            "(%d → %d msgs) but %s; aborting before summary "
+                            "or rotation to retain the live transcript",
                             _lock_sid,
                             len(messages),
                             len(durable_parent),
+                            failure_class.replace("_", " "),
                         )
-                    else:
-                        # Re-read after the flush so the adopted snapshot
-                        # carries the just-persisted tail.
-                        durable_parent = durable_loader(_lock_db, _lock_sid)
-                    if (
-                        _preflush_ok
-                        and isinstance(durable_parent, list)
-                        and len(durable_parent) > len(messages)
-                    ):
+                        _emit_compression_attempt_telemetry(
+                            agent,
+                            started_at=_attempt_started_at,
+                            commit_status="aborted",
+                            split_status="aborted",
+                            failure_class=failure_class,
+                        )
+                        _release_lock()
+                        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                        if not existing_prompt:
+                            existing_prompt = agent._build_system_prompt(system_message)
+                        return messages, existing_prompt
+
+                    # The preflush may have retried a valid transient lease
+                    # collision. Re-read only after it succeeds so the canonical
+                    # continuation includes both concurrent rows and this turn's
+                    # tail exactly once.
+                    durable_parent = durable_loader(_lock_db, _lock_sid)
+                    if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
                         logger.info(
                             "compression: session=%s grew before lease "
                             "(%d → %d msgs); adopting durable snapshot",
@@ -2812,14 +2852,10 @@ def compress_context(
                         _pre_msg_count = len(messages)
                         # Token estimate was for the stale snapshot; clear it so
                         # the compressor re-derives from the adopted transcript
-                        # instead of under-counting the newly visible rows.
+                        # instead of under-counting newly visible rows.
                         approx_tokens = 0
-                        # The whole adopted list is durable (DB re-read plus
-                        # the just-flushed tail). Re-anchor the persist index
-                        # at the end so the rotation-boundary flush that runs
-                        # after compression skips the adopted rows by identity
-                        # (conversation_history=messages[:idx]) instead of
-                        # re-appending the concurrent rows and the live tail.
+                        # The adopted list is durable, so later boundary flushes
+                        # do not duplicate the canonical continuation.
                         agent._persist_user_message_idx = len(messages)
 
         # Notify external memory provider before compression discards context.
@@ -3314,7 +3350,7 @@ def compress_context(
                     current_idx = getattr(agent, "_persist_user_message_idx", None)
                     persisted_history = (
                         messages[:current_idx]
-                        if isinstance(current_idx, int)
+                        if type(current_idx) is int
                         and 0 <= current_idx <= len(messages)
                         else None
                     )
