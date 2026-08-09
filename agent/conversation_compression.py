@@ -2749,19 +2749,114 @@ def compress_context(
             if callable(durable_loader):
                 durable_parent = durable_loader(_lock_db, _lock_sid)
                 if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
-                    logger.info(
-                        "compression: session=%s grew before lease "
-                        "(%d → %d msgs); adopting durable snapshot",
-                        _lock_sid,
-                        len(messages),
-                        len(durable_parent),
+                    # The in-memory transcript may carry this turn's user tail
+                    # outside state.db. Only a positively known empty tail can
+                    # adopt the newer durable parent directly; an absent or
+                    # invalid boundary is not evidence that input is safe to
+                    # discard.
+                    preflush_index = getattr(agent, "_persist_user_message_idx", None)
+                    has_live_tail = (
+                        isinstance(preflush_index, int)
+                        and 0 <= preflush_index < len(messages)
                     )
-                    messages = durable_parent
-                    _pre_msg_count = len(messages)
-                    # Token estimate was for the stale snapshot; clear it so
-                    # the compressor re-derives from the adopted transcript
-                    # instead of under-counting the newly visible rows.
-                    approx_tokens = 0
+                    # A missing boundary is normal for a cold stale snapshot.
+                    # It can adopt only when the durable parent already covers
+                    # every caller message in the same order. Any divergence
+                    # means local state may be a live tail, so it must abort.
+                    def _durable_covers_snapshot() -> bool:
+                        if len(durable_parent) < len(messages):
+                            return False
+                        ignored_keys = {"timestamp", "_db_persisted"}
+                        for durable_message, snapshot_message in zip(
+                            durable_parent, messages
+                        ):
+                            if not isinstance(durable_message, dict) or not isinstance(
+                                snapshot_message, dict
+                            ):
+                                return False
+                            durable_value = {
+                                key: value
+                                for key, value in durable_message.items()
+                                if key not in ignored_keys
+                            }
+                            snapshot_value = {
+                                key: value
+                                for key, value in snapshot_message.items()
+                                if key not in ignored_keys
+                            }
+                            if durable_value != snapshot_value:
+                                return False
+                        return True
+
+                    known_empty_tail = (
+                        isinstance(preflush_index, int)
+                        and preflush_index == len(messages)
+                    ) or (
+                        preflush_index is None and _durable_covers_snapshot()
+                    )
+                    preflush_ok = known_empty_tail
+                    failure_class = "live_tail_boundary_unknown"
+                    if has_live_tail:
+                        try:
+                            # run_agent forwards the active compression holder
+                            # to append_messages_batch. The owner is therefore
+                            # admitted while a valid lease is live, while any
+                            # lost/exhausted lease remains rejected by SessionDB.
+                            preflush_ok = bool(
+                                agent._flush_messages_to_session_db(
+                                    messages,
+                                    conversation_history=messages[:preflush_index],
+                                )
+                            )
+                        except Exception:
+                            preflush_ok = False
+                        failure_class = "live_tail_persistence_failed"
+
+                    if not preflush_ok:
+                        logger.warning(
+                            "compression: session=%s grew before lease "
+                            "(%d → %d msgs) but %s; aborting before summary "
+                            "or rotation to retain the live transcript",
+                            _lock_sid,
+                            len(messages),
+                            len(durable_parent),
+                            failure_class.replace("_", " "),
+                        )
+                        _emit_compression_attempt_telemetry(
+                            agent,
+                            started_at=_attempt_started_at,
+                            commit_status="aborted",
+                            split_status="aborted",
+                            failure_class=failure_class,
+                        )
+                        _release_lock()
+                        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                        if not existing_prompt:
+                            existing_prompt = agent._build_system_prompt(system_message)
+                        return messages, existing_prompt
+
+                    # The preflush may have retried a valid transient lease
+                    # collision. Re-read only after it succeeds so the canonical
+                    # continuation includes both concurrent rows and this turn's
+                    # tail exactly once.
+                    durable_parent = durable_loader(_lock_db, _lock_sid)
+                    if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
+                        logger.info(
+                            "compression: session=%s grew before lease "
+                            "(%d → %d msgs); adopting durable snapshot",
+                            _lock_sid,
+                            len(messages),
+                            len(durable_parent),
+                        )
+                        messages = durable_parent
+                        _pre_msg_count = len(messages)
+                        # Token estimate was for the stale snapshot; clear it so
+                        # the compressor re-derives from the adopted transcript
+                        # instead of under-counting newly visible rows.
+                        approx_tokens = 0
+                        # The adopted list is durable, so later boundary flushes
+                        # do not duplicate the canonical continuation.
+                        agent._persist_user_message_idx = len(messages)
 
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
