@@ -67,6 +67,11 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
+
+    async def dispatch_key_lookup(request):
+        return await adapter._handle_get_run_by_dispatch_key(request)
+
+    app.router.add_get("/v1/runs/dispatch-key", dispatch_key_lookup)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
@@ -411,6 +416,118 @@ class TestStartRun:
 
         expected = workspace.resolve()
         assert Path(observed.get("agent")).resolve() == expected or Path(observed.get("context")).resolve() == expected
+
+
+class TestDispatchKeyAtMostOnce:
+    @pytest.mark.asyncio
+    async def test_replays_the_same_accepted_run_for_duplicate_post_after_proxy_response_loss(self, adapter):
+        app = _create_runs_app(adapter)
+        key = "pib-dispatch-v1-00000000000000000001"
+        headers = {"Idempotency-Key": key}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                accepted = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+                retry_after_proxy_loss = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+
+                assert accepted.status == 202
+                assert retry_after_proxy_loss.status == 202
+                accepted_data = await accepted.json()
+                retry_data = await retry_after_proxy_loss.json()
+
+        assert retry_data["run_id"] == accepted_data["run_id"]
+        assert retry_data["replayed"] is True
+        mock_create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_atomically_deduplicates_concurrent_duplicate_posts(self, adapter):
+        app = _create_runs_app(adapter)
+        headers = {"Idempotency-Key": "pib-dispatch-v1-00000000000000000004"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                first, second = await asyncio.gather(
+                    cli.post("/v1/runs", json={"input": "same"}, headers=headers),
+                    cli.post("/v1/runs", json={"input": "same"}, headers=headers),
+                )
+                first_data, second_data = await asyncio.gather(first.json(), second.json())
+
+        assert first.status == 202
+        assert second.status == 202
+        assert first_data["run_id"] == second_data["run_id"]
+        mock_create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_rejects_same_dispatch_key_with_a_conflicting_payload(self, adapter):
+        app = _create_runs_app(adapter)
+        headers = {"Idempotency-Key": "pib-dispatch-v1-00000000000000000002"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                accepted = await cli.post("/v1/runs", json={"input": "first"}, headers=headers)
+                conflicting = await cli.post("/v1/runs", json={"input": "different"}, headers=headers)
+                conflict_data = await conflicting.json()
+
+        assert accepted.status == 202
+        assert conflicting.status == 409
+        assert conflict_data["error"]["code"] == "idempotency_key_conflict"
+        mock_create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_validates_dispatch_key_before_admission(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs",
+                json={"input": "hello"},
+                headers={"Idempotency-Key": "contains whitespace"},
+            )
+            data = await response.json()
+
+        assert response.status == 400
+        assert data["error"]["code"] == "invalid_dispatch_key"
+
+    @pytest.mark.asyncio
+    async def test_authenticated_lookup_by_dispatch_key_returns_the_accepted_run(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        key = "pib-dispatch-v1-00000000000000000003"
+        headers = {"Authorization": "Bearer sk-secret", "Idempotency-Key": key}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                accepted = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+                accepted_data = await accepted.json()
+                unauthenticated = await cli.get("/v1/runs/dispatch-key", headers={"Idempotency-Key": key})
+                lookup = await cli.get("/v1/runs/dispatch-key", headers=headers)
+                lookup_data = await lookup.json()
+
+        assert accepted.status == 202
+        assert unauthenticated.status == 401
+        assert lookup.status == 200
+        assert lookup_data["run_id"] == accepted_data["run_id"]
 
 
 # ---------------------------------------------------------------------------
