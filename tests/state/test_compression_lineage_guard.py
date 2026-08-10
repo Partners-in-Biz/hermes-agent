@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -280,19 +281,37 @@ def test_publish_compression_child_rejects_lost_or_expired_lease(db: SessionDB) 
     ]
 
 
-def test_compression_lease_blocks_non_owner_but_allows_owner_flush(
-    db: SessionDB,
+def test_compression_lease_delays_non_owner_but_allows_owner_flush(
+    db: SessionDB, monkeypatch
 ) -> None:
+    """An ordinary turn waits for a valid lease; the owner remains admitted."""
+    monkeypatch.setattr(SessionDB, "_COMPRESSION_BUSY_WAIT_S", 1.0)
     db.create_session("leased", source="webui")
     assert db.try_acquire_compression_lock("leased", "winner", ttl_seconds=60)
 
-    with pytest.raises(RuntimeError, match="being compressed"):
-        db.append_message("leased", "user", "late stale turn")
+    released = threading.Event()
 
+    def _release_soon() -> None:
+        time.sleep(0.1)
+        db.release_compression_lock("leased", "winner")
+        released.set()
+
+    thread = threading.Thread(target=_release_soon, daemon=True)
+    thread.start()
+    try:
+        db.append_message("leased", "user", "late ordinary turn")
+    finally:
+        thread.join(timeout=5)
+
+    assert released.is_set()
+    assert db.try_acquire_compression_lock("leased", "winner", ttl_seconds=60)
     db.append_message(
         "leased",
         "assistant",
         "winner flush",
         compression_lock_holder="winner",
     )
-    assert [m["content"] for m in db.get_messages("leased")] == ["winner flush"]
+    assert [m["content"] for m in db.get_messages("leased")] == [
+        "late ordinary turn",
+        "winner flush",
+    ]
