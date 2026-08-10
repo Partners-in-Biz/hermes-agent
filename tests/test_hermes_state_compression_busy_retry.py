@@ -176,3 +176,40 @@ def test_replaced_owner_fails_fast_instead_of_waiting_to_append(
         row["content"] == "must not land under old owner"
         for row in db.get_messages("sess1")
     )
+
+
+def test_batch_append_rejects_an_expired_owner_lease(db: SessionDB) -> None:
+    """The batch writer shares the holder-qualified lease boundary."""
+    assert db.try_acquire_compression_lock("sess1", "compressor", ttl_seconds=0.01)
+    time.sleep(0.03)
+
+    with pytest.raises(CompressionSessionBusyError):
+        db.append_messages_batch(
+            "sess1",
+            [{"role": "user", "content": "batch must not land after expiry"}],
+            compression_lock_holder="compressor",
+        )
+
+    assert not any(
+        row["content"] == "batch must not land after expiry"
+        for row in db.get_messages("sess1")
+    )
+
+
+def test_batch_append_rejects_a_replaced_owner_lease(db: SessionDB) -> None:
+    """A batch cannot write after its holder token has been superseded."""
+    assert db.try_acquire_compression_lock("sess1", "old-owner", ttl_seconds=0.01)
+    time.sleep(0.03)
+    assert db.try_acquire_compression_lock("sess1", "new-owner", ttl_seconds=60)
+
+    with pytest.raises(CompressionSessionBusyError):
+        db.append_messages_batch(
+            "sess1",
+            [{"role": "user", "content": "batch must not land under old owner"}],
+            compression_lock_holder="old-owner",
+        )
+
+    assert not any(
+        row["content"] == "batch must not land under old owner"
+        for row in db.get_messages("sess1")
+    )
