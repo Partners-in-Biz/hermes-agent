@@ -15,7 +15,6 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
-- GET  /v1/runs/dispatch-key    — retrieve accepted run status by Idempotency-Key
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
@@ -1052,24 +1051,6 @@ class RunStatusStore:
                     updated_at REAL NOT NULL
                 )"""
             )
-            # The dispatch record is intentionally co-stored with the pollable
-            # run status. A successful insert means the run id is accepted and
-            # recoverable after a process restart, before the agent task is
-            # allowed to execute. Scope keeps multiplexed profiles from
-            # accidentally reconciling another profile's key.
-            self._conn.execute(
-                """CREATE TABLE IF NOT EXISTS run_dispatches (
-                    scope TEXT NOT NULL,
-                    dispatch_key TEXT NOT NULL,
-                    payload_hash TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    PRIMARY KEY (scope, dispatch_key)
-                )"""
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_run_dispatches_run_id ON run_dispatches (run_id)"
-            )
             self._conn.commit()
 
     def load_all(self) -> Dict[str, Dict[str, Any]]:
@@ -1085,74 +1066,6 @@ class RunStatusStore:
             if isinstance(data, dict):
                 statuses[str(run_id)] = data
         return statuses
-
-    def get(self, run_id: str) -> Optional[Dict[str, Any]]:
-        """Read one persisted status for reconciliation after a restart."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT data FROM run_statuses WHERE run_id = ?", (run_id,)
-            ).fetchone()
-        if row is None:
-            return None
-        try:
-            data = json.loads(row[0])
-        except Exception:
-            return None
-        return data if isinstance(data, dict) else None
-
-    def lookup_dispatch(self, scope: str, dispatch_key: str) -> Optional[Dict[str, str]]:
-        """Return the immutable acceptance record for a scoped dispatch key."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT payload_hash, run_id FROM run_dispatches WHERE scope = ? AND dispatch_key = ?",
-                (scope, dispatch_key),
-            ).fetchone()
-        if row is None:
-            return None
-        return {"payload_hash": str(row[0]), "run_id": str(row[1])}
-
-    def claim_dispatch(
-        self,
-        *,
-        scope: str,
-        dispatch_key: str,
-        payload_hash: str,
-        run_id: str,
-        initial_status: Dict[str, Any],
-    ) -> tuple[str, str]:
-        """Atomically accept a keyed run or return the existing key owner.
-
-        The status and immutable key mapping commit in one SQLite transaction.
-        Callers may only schedule the background agent task after ``accepted``;
-        a concurrent or post-proxy retry receives ``replay`` or ``conflict``
-        together with the original run id instead of creating another run.
-        """
-        payload = json.dumps(initial_status, default=str)
-        updated_at = float(initial_status.get("updated_at", time.time()) or time.time())
-        now = time.time()
-        with self._lock:
-            try:
-                self._conn.execute("BEGIN IMMEDIATE")
-                row = self._conn.execute(
-                    "SELECT payload_hash, run_id FROM run_dispatches WHERE scope = ? AND dispatch_key = ?",
-                    (scope, dispatch_key),
-                ).fetchone()
-                if row is not None:
-                    self._conn.rollback()
-                    return ("replay" if hmac.compare_digest(str(row[0]), payload_hash) else "conflict", str(row[1]))
-                self._conn.execute(
-                    "INSERT INTO run_statuses (run_id, data, updated_at) VALUES (?, ?, ?)",
-                    (run_id, payload, updated_at),
-                )
-                self._conn.execute(
-                    "INSERT INTO run_dispatches (scope, dispatch_key, payload_hash, run_id, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (scope, dispatch_key, payload_hash, run_id, now),
-                )
-                self._conn.commit()
-                return "accepted", run_id
-            except Exception:
-                self._conn.rollback()
-                raise
 
     def put(self, run_id: str, data: Dict[str, Any]) -> None:
         payload = json.dumps(data, default=str)
@@ -1170,19 +1083,11 @@ class RunStatusStore:
                     ")",
                     (count - self._max_size,),
                 )
-            # Dispatch records have exactly the same retention window as their
-            # pollable runs. Keeping a key after its run status was evicted
-            # would replay an irretrievable id forever and make reconciliation
-            # lie after bounded-store cleanup.
-            self._conn.execute(
-                "DELETE FROM run_dispatches WHERE run_id NOT IN (SELECT run_id FROM run_statuses)"
-            )
             self._conn.commit()
 
     def delete(self, run_id: str) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM run_statuses WHERE run_id = ?", (run_id,))
-            self._conn.execute("DELETE FROM run_dispatches WHERE run_id = ?", (run_id,))
             self._conn.commit()
 
     def mark_active_interrupted(self, *, reason: str) -> Dict[str, Dict[str, Any]]:
@@ -2321,7 +2226,6 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
-            ("GET", "/v1/runs/dispatch-key", self._handle_get_run_by_dispatch_key),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
@@ -6710,71 +6614,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
-    _RUN_DISPATCH_KEY_HEADER = "Idempotency-Key"
-    _RUN_DISPATCH_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{15,127}\Z")
-
-    def _parse_run_dispatch_key(
-        self, request: "web.Request", *, required: bool = False
-    ) -> tuple[Optional[str], Optional["web.Response"]]:
-        """Extract a bounded, log-safe idempotency key for /v1/runs.
-
-        Keys are opaque caller-generated identifiers. Rejecting whitespace and
-        controls rather than trimming them prevents a request that was never
-        accepted from being silently reconciled under a different key.
-        """
-        raw = request.headers.get(self._RUN_DISPATCH_KEY_HEADER)
-        if raw is None or raw == "":
-            if required:
-                return None, web.json_response(
-                    _openai_error(
-                        f"Missing {self._RUN_DISPATCH_KEY_HEADER} header",
-                        code="missing_dispatch_key",
-                    ),
-                    status=400,
-                )
-            return None, None
-        if not self._RUN_DISPATCH_KEY_RE.fullmatch(raw):
-            return None, web.json_response(
-                _openai_error(
-                    f"Invalid {self._RUN_DISPATCH_KEY_HEADER} header",
-                    code="invalid_dispatch_key",
-                ),
-                status=400,
-            )
-        return raw, None
-
-    @staticmethod
-    def _run_dispatch_payload_hash(body: Any) -> Optional[str]:
-        """Return a canonical full-body fingerprint for keyed-run conflicts."""
-        try:
-            canonical = json.dumps(
-                body,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-        except (TypeError, ValueError):
-            return None
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _run_dispatch_scope() -> str:
-        """Scope dispatch keys to the multiplexed profile serving this request."""
-        return _api_request_profile.get() or "default"
-
-    def _dispatch_replay_response(self, run_id: str, *, replayed: bool) -> "web.Response":
-        status = self._run_statuses.get(run_id) or self._run_status_store.get(run_id)
-        response = {
-            "run_id": run_id,
-            "status": str((status or {}).get("status") or "started"),
-            "replayed": replayed,
-        }
-        return web.json_response(
-            response,
-            status=202,
-            headers={"Idempotency-Replayed": "true"} if replayed else {},
-        )
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -6891,50 +6730,21 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
-        dispatch_key, dispatch_key_err = self._parse_run_dispatch_key(request)
-        if dispatch_key_err is not None:
-            return dispatch_key_err
-
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(_openai_error("Invalid JSON"), status=400)
-        if not isinstance(body, dict):
-            return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
-
-        dispatch_scope = self._run_dispatch_scope()
-        payload_hash = None
-        if dispatch_key:
-            payload_hash = self._run_dispatch_payload_hash(body)
-            if payload_hash is None:
-                return web.json_response(
-                    _openai_error("Invalid JSON payload for idempotent dispatch", code="invalid_dispatch_payload"),
-                    status=400,
-                )
-            # Reconcile before the concurrency gate or request validation. A
-            # caller that lost a proxy response must get the already accepted
-            # id even if the gateway is now busy or mutable request context
-            # (such as a working directory) has changed.
-            existing = self._run_status_store.lookup_dispatch(dispatch_scope, dispatch_key)
-            if existing is not None:
-                if not hmac.compare_digest(existing["payload_hash"], payload_hash):
-                    return web.json_response(
-                        _openai_error(
-                            "Idempotency-Key was already accepted with a different request payload",
-                            code="idempotency_key_conflict",
-                        ),
-                        status=409,
-                    )
-                return self._dispatch_replay_response(existing["run_id"], replayed=True)
-
         # Long-term memory scope header (see chat_completions for details).
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
 
-        # Replayed keys returned above intentionally bypass the cap because no
-        # new agent work will be created. First-use keys are checked after
-        # request validation below, before their acceptance is committed.
+        # Enforce concurrency limit (shared across all agent-serving
+        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
 
         working_directory = ""
         if "working_directory" in body:
@@ -7066,60 +6876,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
-        created_at = time.time()
-        initial_status = {
-            "object": "hermes.run",
-            "run_id": run_id,
-            "status": "queued",
-            "created_at": created_at,
-            "updated_at": created_at,
-            "session_id": session_id,
-            "model": model_override or body.get("model", self._model_name),
-            "reasoning_effort": body.get("reasoning_effort", body.get("agentEffort")),
-        }
-        if dispatch_key:
-            try:
-                claim, accepted_run_id = self._run_status_store.claim_dispatch(
-                    scope=dispatch_scope,
-                    dispatch_key=dispatch_key,
-                    payload_hash=payload_hash or "",
-                    run_id=run_id,
-                    initial_status=initial_status,
-                )
-            except Exception:
-                logger.exception("[api_server] failed to atomically persist dispatch acceptance")
-                return web.json_response(
-                    _openai_error("Unable to accept run dispatch; retry with the same Idempotency-Key", code="dispatch_store_unavailable"),
-                    status=503,
-                    headers={"Retry-After": "1"},
-                )
-            if claim == "conflict":
-                return web.json_response(
-                    _openai_error(
-                        "Idempotency-Key was already accepted with a different request payload",
-                        code="idempotency_key_conflict",
-                    ),
-                    status=409,
-                )
-            if claim == "replay":
-                return self._dispatch_replay_response(accepted_run_id, replayed=True)
-            self._run_statuses[run_id] = initial_status
-        else:
-            self._set_run_status(
-                run_id,
-                "queued",
-                created_at=created_at,
-                session_id=session_id,
-                model=model_override or body.get("model", self._model_name),
-                reasoning_effort=body.get("reasoning_effort", body.get("agentEffort")),
-            )
-
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -7129,6 +6887,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+        created_at = time.time()
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
@@ -7155,6 +6914,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             except Exception:
                 pass
+
+        self._set_run_status(
+            run_id,
+            "queued",
+            created_at=created_at,
+            session_id=session_id,
+            model=model_override or body.get("model", self._model_name),
+            reasoning_effort=body.get("reasoning_effort", body.get("agentEffort")),
+        )
 
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
@@ -7467,38 +7235,11 @@ class APIServerAdapter(BasePlatformAdapter):
         response_headers = (
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
-        if dispatch_key:
-            return self._dispatch_replay_response(run_id, replayed=False)
         return web.json_response(
             {"run_id": run_id, "status": "started"},
             status=202,
             headers=response_headers,
         )
-
-    async def _handle_get_run_by_dispatch_key(self, request: "web.Request") -> "web.Response":
-        """GET /v1/runs/dispatch-key — authenticated reconciliation by key."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        dispatch_key, key_err = self._parse_run_dispatch_key(request, required=True)
-        if key_err is not None:
-            return key_err
-        record = self._run_status_store.lookup_dispatch(self._run_dispatch_scope(), dispatch_key or "")
-        if record is None:
-            return web.json_response(
-                _openai_error("No accepted run for Idempotency-Key", code="dispatch_key_not_found"),
-                status=404,
-            )
-        status = self._run_statuses.get(record["run_id"]) or self._run_status_store.get(record["run_id"])
-        if status is None:
-            # This should be unreachable because claim_dispatch stores both in
-            # one transaction, but fail explicitly rather than inventing a
-            # successful reconciliation when retention/storage was damaged.
-            return web.json_response(
-                _openai_error("Accepted run status is unavailable", code="dispatch_run_status_unavailable"),
-                status=503,
-            )
-        return web.json_response(status)
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
