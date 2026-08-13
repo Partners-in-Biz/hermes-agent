@@ -139,6 +139,7 @@ _DEFAULT_RUN_MODEL_ALLOWLIST = {
     "gpt-5.2-codex",
     # xAI Grok (API key + SuperGrok OAuth)
     "grok-build-0.1",
+    "grok-4.6",
     "grok-4.5",
     "grok-4.3",
     "grok-composer-2.5-fast",
