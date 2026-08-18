@@ -352,13 +352,18 @@ class TestFlushAfterCompression:
             agent.compression_in_place = False
             agent._ensure_db_session()
 
+            # Transcript must be large enough that the provider-less static
+            # fallback net-shrinks it (middle drops must outweigh the fixed
+            # compaction marker overhead), or the no-growth commit guard
+            # (#ffaa63f887) correctly refuses the rotation this test
+            # exercises and the child session is never created.
             messages = [
                 {
                     "role": "user" if i % 2 == 0 else "assistant",
-                    "content": f"message {i}",
+                    "content": f"message {i} " + "x" * 200,
                     "_db_persisted": True,
                 }
-                for i in range(12)
+                for i in range(40)
             ]
 
             with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
