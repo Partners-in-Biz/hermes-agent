@@ -38,6 +38,7 @@ from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
+from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
@@ -69,6 +70,35 @@ def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
     context = contextvars.copy_context()
     return lambda: context.run(callback)
+
+
+def _join_worker_for_relay_teardown(worker, *, label: str) -> None:
+    """Bounded worker join before raising InterruptedError (#81521).
+
+    Raising immediately lets turn teardown (finish_logical_calls /
+    end_turn / close_session) race a still-open Relay physical LLM scope
+    and corrupt the LIFO stack — "scope handle is not at the top of the
+    stack" → CLI EIO / redraw storm.  Only joins when Relay managed
+    execution is actually live: when no Relay consumers are registered
+    there is no scope to unwind, and the join would just delay interrupt
+    detection (tests/run_agent/test_interrupt_propagation.py).
+    """
+    try:
+        from agent import relay_runtime
+
+        runtime = relay_runtime.get_runtime(create=False)
+        if runtime is None or not runtime.managed_execution_enabled():
+            return
+    except Exception:
+        return
+    worker.join(timeout=2.0)
+    if worker.is_alive():
+        logger.warning(
+            "%s worker still alive after interrupt abort (2.0s join "
+            "timeout); Relay teardown will best-effort drain orphaned "
+            "scopes (#81521).",
+            label,
+        )
 
 
 def _ra():
@@ -549,6 +579,24 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     return preferences
 
 
+def _prompt_cache_scope_for_agent(agent) -> "str | None":
+    """Rotation-stable logical cache scope for *agent*, or None.
+
+    Guarded-import wrapper over the never-raising
+    ``agent.prompt_cache_scope.resolve_prompt_cache_scope_safe`` — the
+    transports treat a None/empty value as "fall back to the physical
+    session_id", so any resolution failure degrades to pre-#79017 behavior
+    instead of blocking the request build.
+    """
+    try:
+        from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
+
+        return resolve_prompt_cache_scope_safe(agent)
+    except Exception:
+        logger.debug("prompt-cache scope resolution failed", exc_info=True)
+        return None
+
+
 def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dict:
     """Merge Portal ``tags`` / ``session_id`` onto an Anthropic Messages kwargs dict.
 
@@ -683,6 +731,34 @@ def _reset_stale_streak(agent) -> None:
         agent._consecutive_stale_streams = 0
     except Exception:
         pass
+
+
+_INTERRUPTED_WAIT_STALE_SECONDS = 30.0
+
+
+def _record_interrupted_provider_wait(
+    agent,
+    elapsed: float,
+    *,
+    response_started: bool,
+) -> bool:
+    """Count a user-aborted pre-response stall toward the stale breaker.
+
+    Interactive users commonly send a follow-up while a provider is wedged.
+    Once the same no-output interval that earns a wait notice has elapsed, that
+    interrupt is evidence of an unresponsive attempt rather than a quick user
+    cancellation. Mid-response and early interrupts remain neutral.
+    """
+    if response_started or elapsed < _INTERRUPTED_WAIT_STALE_SECONDS:
+        return False
+    _bump_stale_streak(agent)
+    logger.warning(
+        "Interrupted provider wait counted as stale after %.0fs with no output; "
+        "consecutive stale attempts=%d.",
+        elapsed,
+        _stale_streak(agent),
+    )
+    return True
 
 
 def _report_stale_nonstream_kill(
@@ -905,6 +981,19 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # MoA is a virtual chat-completions provider backed by the
         # in-process MoAClient facade. Do not rebuild a request-local
         # OpenAI client from the virtual runtime metadata.
+        #
+        # After a client replacement (credential rotation /
+        # dead-connection cleanup / fallback+restore), agent.client may
+        # become a native OpenAI client while agent.provider stays
+        # "moa".  Pop the MoA-internal key so the native SDK does not
+        # reject it as an unexpected kwarg — but only when the live
+        # client is NOT the facade: the facade consumes the key, and
+        # stripping it there forces a wasteful duplicate reference
+        # fan-out (the facade re-prepares from scratch).  Only the MoA
+        # facade's completions object exposes ``prepare()``.  (#78382)
+        _completions = getattr(getattr(agent.client, "chat", None), "completions", None)
+        if not callable(getattr(_completions, "prepare", None)):
+            api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
     return request_client.chat.completions.create(**api_kwargs)
@@ -987,6 +1076,35 @@ def _resolve_direct_stale_timeout(agent, api_kwargs: dict) -> float:
     return float(value)
 
 
+def _inline_nonstream_hard_timeout(stale_timeout: float):
+    """Socket-level backstop for inline non-streaming calls (#85252).
+
+    The keepalive httpx client uses ``read=None`` so SSE streams can idle
+    during reasoning. That same client serves cron/subagent non-streaming
+    calls. Combined with a stranger-thread abort that must not ``close()``
+    the FD (#29507), a hung provider then waits until TCP dies — observed
+    5–11× past the stale threshold.
+
+    Returns an ``httpx.Timeout`` whose read budget equals the stale
+    watchdog, a float if httpx is unavailable, or ``None`` when the
+    watchdog is disarmed (local endpoint / non-finite budget).
+    """
+    if not math.isfinite(stale_timeout) or stale_timeout <= 0:
+        return None
+    conn_cap = min(stale_timeout, 60.0)
+    try:
+        import httpx as _httpx
+
+        return _httpx.Timeout(
+            connect=conn_cap,
+            read=stale_timeout,
+            write=conn_cap,
+            pool=conn_cap,
+        )
+    except Exception:
+        return stale_timeout
+
+
 def direct_api_call(agent, api_kwargs: dict):
     """Run a non-streaming LLM call inline on the conversation thread.
 
@@ -1002,14 +1120,16 @@ def direct_api_call(agent, api_kwargs: dict):
     450s — surfacing as ``Operation interrupted: waiting for model response``.
 
     A stale-call watchdog bounds the request the same way the interrupt
-    worker's poll loop does (#80759). The httpx read timeout alone is not a
-    usable bound: it defaults to 1800s and a provider that accepts the request
-    and then goes silent (connection held open, zero bytes, no error) never
-    trips it, so a cron run hangs until something external kills it — which
-    also orphans the execution row. The watchdog aborts the in-flight sockets
-    through the already-registered abort hook and surfaces a retryable
-    ``TimeoutError`` so the outer retry loop reconnects with backoff /
-    credential rotation / provider fallback.
+    worker's poll loop does (#80759). The keepalive httpx client uses
+    ``read=None`` (SSE), so the socket itself is not a usable bound: a
+    provider that accepts the request and then goes silent never trips a
+    read timeout, and a stranger-thread abort cannot ``close()`` the FD
+    (#29507). The watchdog aborts in-flight sockets through the already-
+    registered abort hook; a per-call ``timeout`` matching the stale budget
+    is the hard backstop when that abort finds nothing to shut down
+    (#85252). Either path surfaces a retryable ``TimeoutError`` so the
+    outer retry loop reconnects with backoff / credential rotation /
+    provider fallback.
     """
     _check_stale_giveup(agent)
     agent._touch_activity("waiting for non-streaming API response")
@@ -1122,6 +1242,14 @@ def direct_api_call(agent, api_kwargs: dict):
     # stalls from the stall monitor.
     call_start = time.time()
     stale_timeout = _resolve_direct_stale_timeout(agent, api_kwargs)
+    # Do not override an explicit per-call timeout (provider config /
+    # transport already set one). Otherwise pin read=stale_timeout so a
+    # no-op stranger-thread abort cannot leave the keepalive client's
+    # read=None socket hanging until TCP dies (#85252).
+    hard_timeout = _inline_nonstream_hard_timeout(stale_timeout)
+    if hard_timeout is not None and "timeout" not in api_kwargs:
+        api_kwargs = dict(api_kwargs)
+        api_kwargs["timeout"] = hard_timeout
     activity_hb.start()
 
     def _on_stale() -> None:
@@ -1651,6 +1779,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
             break
 
         if agent._interrupt_requested:
+            _record_interrupted_provider_wait(
+                agent,
+                _elapsed,
+                response_started=(
+                    _codex_watchdog_enabled
+                    and getattr(agent, "_codex_stream_last_event_ts", None) is not None
+                ),
+            )
             # Mark THIS request cancelled before force-closing so the worker's
             # exception handler recognizes the forced transport error as a
             # cancel and exits cleanly instead of surfacing a network error or
@@ -1669,6 +1805,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 _close_request_client_once("interrupt_abort")
             except Exception:
                 pass
+            # #81521 (sibling of the streaming-path fix): wait for the worker
+            # to unwind Relay-managed scopes before surfacing
+            # InterruptedError, so turn teardown cannot race a still-open
+            # physical scope and corrupt the LIFO stack. No-op when Relay
+            # managed execution is not live.
+            _join_worker_for_relay_teardown(t, label="Non-streaming")
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
         raise result["error"]
@@ -1727,6 +1869,12 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             region=region,
             guardrail_config=guardrail,
         )
+
+    # Rotation-stable logical cache scope, shared by every OpenAI-wire branch
+    # below (codex + both chat_completions paths). Memoized on the agent —
+    # cheap after the first call. Resolved after the anthropic/bedrock early
+    # returns above, which don't use prompt_cache_key.
+    _cache_scope_id = _prompt_cache_scope_for_agent(agent)
 
     if agent.api_mode == "codex_responses":
         _ct = agent._get_transport()
@@ -1793,6 +1941,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             tools=tools_for_api,
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
+            cache_scope_id=_cache_scope_id,
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
@@ -1818,8 +1967,8 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         base_url_host_matches(agent._base_url_lower, "models.github.ai")
         or base_url_host_matches(agent._base_url_lower, "githubcopilot.com")
     )
-    _is_nous = "nousresearch" in agent._base_url_lower
-    _is_nvidia = "integrate.api.nvidia.com" in agent._base_url_lower
+    _is_nous = base_url_host_matches(agent._base_url_lower, "nousresearch.com")
+    _is_nvidia = base_url_host_matches(agent._base_url_lower, "integrate.api.nvidia.com")
     _is_kimi = (
         base_url_host_matches(agent.base_url, "api.kimi.com")
         or base_url_host_matches(agent.base_url, "moonshot.ai")
@@ -1902,6 +2051,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             reasoning_config=agent.reasoning_config,
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
+            cache_scope_id=_cache_scope_id,
             provider_profile=_profile,
             ollama_num_ctx=agent._ollama_num_ctx,
             # Context forwarded to profile hooks:
@@ -1934,6 +2084,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         reasoning_config=agent.reasoning_config,
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),
+        cache_scope_id=_cache_scope_id,
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
         is_nous=_is_nous,
@@ -2042,12 +2193,12 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     # a DB-side pad can't survive ``_rows_to_conversation``'s whitespace strip
     # anyway.  Repair belongs at the send boundary, once.
 
-    msg = {
+    msg = stamp_message_timestamp({
         "role": "assistant",
         "content": _san_content,
         "reasoning": reasoning_text,
         "finish_reason": finish_reason,
-    }
+    })
 
     raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
     if raw_reasoning_content is None and hasattr(assistant_message, "model_extra"):
@@ -2725,7 +2876,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
 
     summary_request = MAX_ITERATIONS_SUMMARY_REQUEST
-    messages.append({"role": "user", "content": summary_request})
+    append_message(messages, {"role": "user", "content": summary_request})
 
     try:
         # Build API messages, stripping internal-only fields
@@ -2948,7 +3099,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
             if final_response:
                 summary_call_outcome = "success"
-                messages.append({"role": "assistant", "content": final_response})
+                append_message(
+                    messages,
+                    {"role": "assistant", "content": final_response},
+                )
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
         else:
@@ -3010,7 +3164,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
                 if final_response:
                     summary_call_outcome = "success"
-                    messages.append({"role": "assistant", "content": final_response})
+                    append_message(
+                        messages,
+                        {"role": "assistant", "content": final_response},
+                    )
                 else:
                     final_response = "I reached the iteration limit and couldn't generate a summary."
             else:
@@ -3203,7 +3360,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # events wedges the thread forever. on_event stamps this on EVERY
         # yielded Bedrock event (text/tool/metadata) — the poll loop below
         # trips a watchdog when the gap exceeds the stale timeout.
-        _bedrock_last_event = {"t": time.time()}
+        _bedrock_started_at = time.time()
+        _bedrock_last_event = {"t": _bedrock_started_at}
+        _bedrock_response_started = {"yes": False}
         # Region captured for the poll-loop client eviction below.  Read
         # (not popped) here so the worker's own pop inside _bedrock_call still
         # resolves the same value.
@@ -3272,15 +3431,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     return raw_response.get("stream", [])
 
                 def _on_text(text):
+                    _bedrock_response_started["yes"] = True
                     _fire_first()
                     agent._fire_stream_delta(text)
                     deltas_were_sent["yes"] = True
 
                 def _on_tool(name):
+                    _bedrock_response_started["yes"] = True
                     _fire_first()
                     agent._fire_tool_gen_started(name)
 
                 def _on_reasoning(text):
+                    _bedrock_response_started["yes"] = True
                     _fire_first()
                     agent._fire_reasoning_delta(text)
 
@@ -3359,6 +3521,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             while t.is_alive():
                 t.join(timeout=0.3)
                 if agent._interrupt_requested:
+                    _record_interrupted_provider_wait(
+                        agent,
+                        time.time() - _bedrock_started_at,
+                        response_started=_bedrock_response_started["yes"],
+                    )
+                    # #81521 (sibling of the main streaming-path fix): give
+                    # the Bedrock worker a bounded window to unwind its
+                    # Relay-managed stream scopes before surfacing
+                    # InterruptedError. No-op when Relay managed execution
+                    # is not live.
+                    _join_worker_for_relay_teardown(t, label="Bedrock streaming")
                     raise InterruptedError("Agent interrupted during Bedrock API call")
                 # Liveness watchdog: no Bedrock event for longer than the stale
                 # timeout means the stream has wedged (open socket, keep-alives but
@@ -3419,6 +3592,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Bedrock path — mirrors the post-worker guard on the main streaming
             # loop. (#59999 area)
             if agent._interrupt_requested:
+                _record_interrupted_provider_wait(
+                    agent,
+                    time.time() - _bedrock_started_at,
+                    response_started=_bedrock_response_started["yes"],
+                )
                 raise InterruptedError("Agent interrupted during Bedrock API call (post-worker)")
             if result["error"] is not None:
                 raise result["error"]
@@ -4998,6 +5176,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
         if agent._interrupt_requested:
+            # The stale branch above already counted this iteration when its
+            # deadline won the race; do not double-count a simultaneous stop.
+            if _stale_elapsed <= _stream_stale_timeout:
+                _record_interrupted_provider_wait(
+                    agent,
+                    _stale_elapsed,
+                    response_started=deltas_were_sent["yes"],
+                )
             # Mark THIS request cancelled before force-closing so the worker's
             # exception handler recognizes the forced transport error as a
             # cancel and exits without retrying or surfacing a network error.
@@ -5015,6 +5201,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _close_request_client_once("stream_interrupt_abort")
             except Exception:
                 pass
+            # Wait for the worker to unwind Relay-managed stream scopes
+            # (physical LLM + deferred logical) before surfacing
+            # InterruptedError. Raising immediately lets turn teardown
+            # (finish_logical_calls / end_turn / close_session) race a
+            # still-open physical scope and corrupt the LIFO stack —
+            # "scope handle is not at the top of the stack" → CLI EIO /
+            # redraw storm (#81521). No-op when Relay managed execution
+            # is not live.
+            _join_worker_for_relay_teardown(t, label="Streaming")
             raise InterruptedError("Agent interrupted during streaming API call")
     # Worker thread exited before the main thread's poll loop could check
     # the interrupt flag.  If the worker returned early due to an interrupt

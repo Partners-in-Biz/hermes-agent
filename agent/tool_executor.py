@@ -392,6 +392,16 @@ class _ToolTimeoutResult(str):
     """Marker for a synthesized sequential-tool timeout result."""
 
 
+class _ToolCancelledResult(str):
+    """Marker for a synthesized sequential-tool user-interrupt result.
+
+    Like ``_ToolTimeoutResult``, the executor already emitted the terminal
+    post_tool_call event for this call (status="cancelled"), so downstream
+    emission must be suppressed — an abandoned worker finishing late must not
+    report success for a call the user already cancelled.
+    """
+
+
 class _ConcurrentToolAuthorizationGate:
     """Serialize policy prompts and exclude human approval waits from batch deadlines.
 
@@ -483,6 +493,50 @@ def _managed_values(
     )
 
 
+# Cadence for the in-flight tool activity heartbeat. Must stay far below the
+# gateway turn-inactivity timeout (default 1800s) so a silent-but-healthy
+# tool call never looks idle to the watchdog.
+_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S = 30.0
+
+
+def _run_tool_activity_heartbeat(
+    agent,
+    stop_event: threading.Event,
+    label: str,
+    interval: float = _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S,
+) -> None:
+    """Refresh the agent's activity clock while a tool call is in flight.
+
+    The gateway's turn-inactivity watchdog
+    (``gateway/run.py::_watch_gateway_turn_inactivity``) abandons a turn
+    once ``seconds_since_activity`` exceeds the inactivity timeout
+    (default 30 min). Activity is stamped when a tool *starts* and when it
+    *completes*, but a tool call that runs silently for 30+ minutes
+    (quiet builds, long pytest suites, large downloads, network waits that
+    emit no output) previously froze the clock at "executing tool: <name>"
+    and the watchdog hard-abandoned a turn that was still making progress,
+    reaping the tool's processes mid-execution.
+
+    This daemon thread touches ``agent._touch_activity`` every ``interval``
+    seconds until ``stop_event`` is set (the tool call returned), so the
+    gateway keeps seeing a live turn for the whole duration of the call.
+
+    A tool that truly hangs is still bounded by the tool layer's own
+    timeouts (terminal ``timeout`` default 180s, the concurrent batch
+    deadline ~420s), so the heartbeat only extends the turn's life for as
+    long as the tool call is legitimately executing — it does not unbind
+    wedged tools. The 30-min gateway backstop remains for turns whose
+    agent loop itself stalls (no API call, no tool call in flight).
+    """
+
+    try:
+        while not stop_event.wait(interval):
+            agent._touch_activity(label)
+    except Exception:
+        # A heartbeat must never break the agent loop.
+        pass
+
+
 def _run_agent_tool_execution_middleware(
     agent,
     *,
@@ -546,10 +600,11 @@ def _run_agent_tool_execution_middleware(
             block_error_type = "plugin_block"
 
             def _resolve_pre_tool_block():
+                nonlocal final_args
                 try:
-                    from hermes_cli.plugins import resolve_pre_tool_block
+                    from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
 
-                    return resolve_pre_tool_block(
+                    block_msg, modified_args = _dispatch_pre_tool_call_hooks(
                         function_name,
                         final_args,
                         task_id=effective_task_id or "",
@@ -560,6 +615,10 @@ def _run_agent_tool_execution_middleware(
                         or "",
                         middleware_trace=list(state["middleware_trace"]),
                     )
+                    if modified_args is not None:
+                        final_args = modified_args
+                        state["args"] = modified_args
+                    return block_msg
                 except Exception:
                     return None
 
@@ -611,7 +670,27 @@ def _run_agent_tool_execution_middleware(
             agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
-        return execute(final_args)
+
+        # Keep the gateway turn-inactivity watchdog from abandoning a turn
+        # whose tool call runs silently for longer than the inactivity
+        # timeout (#84491): stamp activity periodically while the tool is
+        # in flight, not just at start/completion. Both the sequential and
+        # the concurrent paths funnel through here, so a single heartbeat
+        # covers every tool.
+        _hb_stop = threading.Event()
+        _hb_thread = threading.Thread(
+            target=_run_tool_activity_heartbeat,
+            args=(agent, _hb_stop, f"tool running: {function_name}"),
+            kwargs={"interval": _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S},
+            daemon=True,
+            name=f"tool-activity-hb-{function_name[:24]}",
+        )
+        _hb_thread.start()
+        try:
+            return execute(final_args)
+        finally:
+            _hb_stop.set()
+            _hb_thread.join(timeout=2.0)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(
@@ -664,6 +743,12 @@ def _run_agent_tool_execution_middleware(
         blocked=bool(state["blocked"]),
         dispatched=bool(state["dispatched"]),
     )
+
+
+# How often the sequential-tool wait loop wakes to check for a user
+# interrupt while the worker runs. Short enough that /stop or a redirect
+# lands within ~1s even when the tool itself never polls is_interrupted().
+_SEQUENTIAL_INTERRUPT_POLL_SECONDS = 1.0
 
 
 def _resolve_sequential_tool_timeout() -> float | None:
@@ -719,7 +804,7 @@ def _run_sequential_tool_execution_middleware(
         "display_index": display_index,
         "middleware_trace": middleware_trace,
     }
-    if timeout_s is None or function_name in _NEVER_PARALLEL_TOOLS:
+    if function_name in _NEVER_PARALLEL_TOOLS:
         return _run_agent_tool_execution_middleware(agent, **kwargs)
 
     from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -746,26 +831,87 @@ def _run_sequential_tool_execution_middleware(
 
     executor = DaemonThreadPoolExecutor(max_workers=1)
     future = executor.submit(propagate_context_to_thread(_run))
-    deadline = time.monotonic() + timeout_s
+    # ``timeout_s`` disabled (None) still runs on the worker: the wait loop
+    # below is what makes a non-cooperative tool interruptible at all, so
+    # "no deadline" must not mean "no interrupt checks" (#86xxx class fix —
+    # sequential path previously blocked until the tool returned).
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     started = time.monotonic()
     timed_out = False
+    interrupted = False
+    _last_heartbeat = 0
     try:
         while True:
-            remaining = (
-                deadline + authorization_gate.excluded_seconds() - time.monotonic()
-            )
-            if remaining <= 0:
-                timed_out = True
-                break
+            wait_slice = _SEQUENTIAL_INTERRUPT_POLL_SECONDS
+            if deadline is not None:
+                remaining = (
+                    deadline + authorization_gate.excluded_seconds() - time.monotonic()
+                )
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                wait_slice = min(wait_slice, remaining)
             try:
-                return future.result(timeout=min(5.0, remaining))
+                return future.result(timeout=wait_slice)
             except concurrent.futures.TimeoutError:
+                if agent._interrupt_requested:
+                    interrupted = True
+                    break
                 elapsed = int(time.monotonic() - started)
-                if elapsed > 0 and elapsed % 30 < 5:
+                if elapsed - _last_heartbeat >= 30:
+                    _last_heartbeat = elapsed
                     agent._touch_activity(
                         f"sequential tool running ({elapsed}s): {function_name}"
                     )
 
+        if interrupted:
+            # Belt-and-braces: interrupt() already fans out to tracked worker
+            # tids, but the worker may have registered after the fan-out ran.
+            for tid in worker_tid:
+                try:
+                    _ra()._set_interrupt(True, tid)
+                except Exception:
+                    pass
+            # Give a cooperative tool a moment to notice its per-thread
+            # interrupt bit and return a real result (mirrors the concurrent
+            # path's 3s grace).
+            concurrent.futures.wait([future], timeout=3.0)
+            if future.done() and not future.cancelled():
+                return future.result()
+            timed_out = True  # reuse the abandon-shutdown path in finally
+            future.cancel()
+            message = (
+                f"[Tool execution cancelled — {function_name} was abandoned "
+                "after user interrupt]"
+            )
+            logger.info(
+                "sequential tool %s abandoned after user interrupt (%.1fs elapsed)",
+                function_name, time.monotonic() - started,
+            )
+            trace = middleware_trace if middleware_trace is not None else []
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=message,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                status="cancelled",
+                error_type="keyboard_interrupt",
+                error_message="Tool execution cancelled by user interrupt",
+                middleware_trace=list(trace),
+            )
+            return _ManagedToolResult(
+                result=_ToolCancelledResult(message),
+                args=function_args,
+                middleware_trace=trace,
+                blocked=False,
+                dispatched=True,
+            )
+
+        # Only reachable when a deadline exists (interrupted returns above).
+        assert timeout_s is not None
         message = (
             f"Error executing tool '{function_name}': "
             f"timed out after {timeout_s:.1f}s"
@@ -1911,6 +2057,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     around_message_id=next_args.get("around_message_id"),
                     window=next_args.get("window", 5),
                     sort=next_args.get("sort"),
+                    detail=next_args.get("detail", "adaptive"),
                     db=session_db,
                     current_session_id=agent.session_id,
                 )
@@ -2350,7 +2497,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
-        _execution_timed_out = isinstance(function_result, _ToolTimeoutResult)
+        _execution_timed_out = isinstance(
+            function_result, (_ToolTimeoutResult, _ToolCancelledResult)
+        )
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result

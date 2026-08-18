@@ -7,7 +7,9 @@ import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import {
+  $cronSessions,
   $currentCwd,
+  $messagingSessions,
   $sessions,
   commitWorkspaceCwdForSelectedSession,
   releaseWorkspaceCwdOwner,
@@ -139,9 +141,23 @@ const _chatMessageFieldsExhaustive: {
   [K in Exclude<keyof ChatMessage, (typeof COMPARED_FIELDS)[number] | (typeof IGNORED_FIELDS)[number]>]: never
 } = {}
 
-const COMPARED_FIELDS = ['id', 'role', 'pending', 'error', 'hidden', 'branchGroupId', 'interim', 'reactions'] as const
+const COMPARED_FIELDS = [
+  'id',
+  'role',
+  'pending',
+  'error',
+  'hidden',
+  'branchGroupId',
+  'interim',
+  'reactions',
+  'timestamp',
+  'completedAt',
+  // Turn wall-clock duration — stamps the visible "⏱ 38s" badge, so a change
+  // must re-render (set once at completion; stable afterwards).
+  'durationS'
+] as const
 
-const IGNORED_FIELDS = ['timestamp', 'attachmentRefs', 'parts', 'rowId'] as const
+const IGNORED_FIELDS = ['attachmentRefs', 'parts', 'rowId'] as const
 
 // Compile-time check: every ChatMessagePart discriminant must be handled by
 // chatPartsEquivalent. If @assistant-ui adds a new part type, this fails tsc.
@@ -179,6 +195,10 @@ export function chatPartsEquivalent(aPart: ChatMessage['parts'][number], bPart: 
     return false
   }
 
+  if (aPart.timestamp !== bPart.timestamp || aPart.completedAt !== bPart.completedAt) {
+    return false
+  }
+
   if (aPart.type === 'text' || aPart.type === 'reasoning') {
     return (aPart as { text: string }).text === (bPart as { text: string }).text
   }
@@ -202,8 +222,8 @@ export function chatPartsEquivalent(aPart: ChatMessage['parts'][number], bPart: 
   // audio, data-*), fall back to shallow primitive-key comparison — conservative:
   // if we're not sure, claim not-equal (one extra setMessages is harmless, but
   // skipping an update would break the UI).
-  const aPrimitive = aPart as Record<string, unknown>
-  const bPrimitive = bPart as Record<string, unknown>
+  const aPrimitive = aPart as unknown as Record<string, unknown>
+  const bPrimitive = bPart as unknown as Record<string, unknown>
   const aKeys = Object.keys(aPrimitive).filter(k => typeof aPrimitive[k] !== 'object' || aPrimitive[k] === null)
   const bKeys = Object.keys(bPrimitive).filter(k => typeof bPrimitive[k] !== 'object' || bPrimitive[k] === null)
 
@@ -236,6 +256,8 @@ export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean 
     a.error !== b.error ||
     a.hidden !== b.hidden ||
     a.branchGroupId !== b.branchGroupId ||
+    a.timestamp !== b.timestamp ||
+    a.completedAt !== b.completedAt ||
     // Interim gates the action footer, so flipping it must repaint (e.g. a
     // previewed final settling onto a sealed interim bubble restores the bar).
     (a.interim ?? false) !== (b.interim ?? false) ||
@@ -683,10 +705,17 @@ export function preserveLocalPendingTurnMessages(
  * memory. Stable ids let repeated activate/resume hydration reconcile instead
  * of growing duplicate rows.
  */
-export function appendLiveSessionProjection(
-  messages: ChatMessage[],
-  projection: Pick<SessionResumeResponse, 'inflight' | 'queued' | 'session_id'>
-): ChatMessage[] {
+const safelyPersistedInflightUser = Symbol('safelyPersistedInflightUser')
+
+type LiveSessionProjection = Pick<SessionResumeResponse, 'inflight' | 'queued' | 'session_id'> & {
+  [safelyPersistedInflightUser]?: true
+}
+
+type ReconciledSessionResumeResponse = SessionResumeResponse & {
+  [safelyPersistedInflightUser]?: true
+}
+
+export function appendLiveSessionProjection(messages: ChatMessage[], projection: LiveSessionProjection): ChatMessage[] {
   const inflightUser = projection.inflight?.user?.trim() ?? ''
   const inflightAssistant = projection.inflight?.assistant ?? ''
   const inflightStreaming = Boolean(projection.inflight?.streaming)
@@ -762,7 +791,8 @@ export function appendLiveSessionProjection(
       message => textWithoutReferenceLines(chatMessageText(message)) === textWithoutReferenceLines(text)
     )
 
-  const inflightUserAlreadyPersisted = Boolean(inflightUser) && persistedInLatestRun(inflightUser)
+  const inflightUserAlreadyPersisted =
+    projection[safelyPersistedInflightUser] === true || (Boolean(inflightUser) && persistedInLatestRun(inflightUser))
 
   if (inflightUser && !inflightUserAlreadyPersisted) {
     projected.push({
@@ -894,6 +924,224 @@ export function appendLiveSessionProjection(
   return projected.length ? [...messages, ...projected] : messages
 }
 
+function normalizedMessageText(message: ChatMessage): string {
+  return chatMessageText(message).replace(/\s+/g, ' ').trim()
+}
+
+function transcriptAnchorMatches(a: ChatMessage, b: ChatMessage): boolean {
+  if (a.role !== b.role) {
+    return false
+  }
+
+  const aText = normalizedMessageText(a)
+  const bText = normalizedMessageText(b)
+
+  if (a.timestamp !== undefined && b.timestamp !== undefined) {
+    return a.timestamp === b.timestamp && aText === bText
+  }
+
+  return Boolean(aText) && aText === bText
+}
+
+/**
+ * Mark only an already-materialized `inflight.user` for visual suppression.
+ *
+ * A running gateway returns two independent truths: its compressed runtime
+ * history plus the current in-flight turn, while REST may already have flushed
+ * that user row into the complete persisted transcript. Global text dedupe is
+ * unsafe because users may intentionally submit the same prompt twice. Instead,
+ * find the last runtime message inside the persisted transcript and inspect only
+ * the newer persisted suffix.
+ *
+ * Keep `inflight.user` intact because it also carries turn structure: a queued
+ * prompt needs its assistant boundary even when the persisted user has no
+ * assistant delta yet. The private marker lets the renderer suppress only that
+ * duplicate bubble. If the histories have no safe common anchor, keep the
+ * projection unchanged — a duplicate is recoverable, but dropping a real
+ * accepted prompt is not.
+ */
+export function dedupeInflightUserAgainstTranscript(
+  persistedMessages: ChatMessage[],
+  runtimeMessages: ChatMessage[],
+  projection: SessionResumeResponse
+): ReconciledSessionResumeResponse {
+  const inflightUser = projection.inflight?.user?.replace(/\s+/g, ' ').trim() ?? ''
+
+  if (!inflightUser) {
+    return projection
+  }
+
+  let suffixStart = 0
+
+  if (runtimeMessages.length) {
+    const runtimeAnchor = runtimeMessages[runtimeMessages.length - 1]
+    let persistedAnchorIndex = -1
+
+    for (let index = persistedMessages.length - 1; index >= 0; index -= 1) {
+      if (transcriptAnchorMatches(persistedMessages[index], runtimeAnchor)) {
+        persistedAnchorIndex = index
+
+        break
+      }
+    }
+
+    if (persistedAnchorIndex < 0) {
+      return projection
+    }
+
+    suffixStart = persistedAnchorIndex + 1
+  }
+
+  const persistedTail = persistedMessages.slice(suffixStart)
+  const lastPersistedMessage = persistedTail[persistedTail.length - 1]
+
+  const persistedUserPresent =
+    lastPersistedMessage?.role === 'user' && normalizedMessageText(lastPersistedMessage) === inflightUser
+
+  if (!persistedUserPresent) {
+    return projection
+  }
+
+  return { ...projection, [safelyPersistedInflightUser]: true }
+}
+
+/**
+ * Drop only synthetic local tail rows that the activation snapshot replaces.
+ * Unmatched optimistic rows survive so a submit racing with activation is not
+ * lost; completed transcript rows before the open tail are never considered.
+ */
+export function removeRepresentedLocalLiveProjection(
+  previousMessages: ChatMessage[],
+  projection: Pick<SessionResumeResponse, 'inflight' | 'queued'>
+): ChatMessage[] {
+  const inflightUser = projection.inflight?.user?.replace(/\s+/g, ' ').trim() ?? ''
+  const inflightAssistant = projection.inflight?.assistant?.replace(/\s+/g, ' ').trim() ?? ''
+  const queuedUser = projection.queued?.user?.replace(/\s+/g, ' ').trim() ?? ''
+
+  const hasAssistantProjection = Boolean(
+    projection.inflight?.assistant || projection.inflight?.streaming || (inflightUser && queuedUser)
+  )
+
+  if (!inflightUser || !hasAssistantProjection) {
+    return previousMessages
+  }
+
+  let openTailStart = 0
+
+  for (let index = previousMessages.length - 1; index >= 0; index -= 1) {
+    const message = previousMessages[index]
+
+    if (message.role === 'assistant' && !message.pending) {
+      openTailStart = index + 1
+
+      break
+    }
+  }
+
+  const inflightUserIndex = previousMessages.findIndex(
+    (message, index) =>
+      index >= openTailStart &&
+      message.role === 'user' &&
+      message.id.startsWith('user-') &&
+      normalizedMessageText(message) === inflightUser
+  )
+
+  const assistantIndex = inflightUserIndex + 1
+  const assistant = previousMessages[assistantIndex]
+
+  const assistantMatches =
+    inflightUserIndex >= openTailStart &&
+    assistant?.role === 'assistant' &&
+    assistant.id.startsWith('assistant-stream-') &&
+    normalizedMessageText(assistant) === inflightAssistant
+
+  if (!assistantMatches) {
+    return previousMessages
+  }
+
+  let queuedUserIndex = -1
+
+  if (queuedUser) {
+    queuedUserIndex = previousMessages.findIndex(
+      (message, index) =>
+        index > assistantIndex &&
+        message.role === 'user' &&
+        message.id.startsWith('user-queued-') &&
+        normalizedMessageText(message) === queuedUser
+    )
+  }
+
+  return previousMessages.filter(
+    (_message, index) => index !== inflightUserIndex && index !== assistantIndex && index !== queuedUserIndex
+  )
+}
+
+/**
+ * Overlay messages that changed while activation waited on REST. Existing ids
+ * replace the older activation row; only rows added or changed since the warm
+ * cache baseline are appended. This is identity-based, never text-based.
+ */
+export function overlayConcurrentMessageChanges(
+  nextMessages: ChatMessage[],
+  baselineMessages: ChatMessage[],
+  currentMessages: ChatMessage[]
+): ChatMessage[] {
+  const baselineById = new Map(baselineMessages.map(message => [message.id, message]))
+  const nextIndexById = new Map(nextMessages.map((message, index) => [message.id, index]))
+  let changed = false
+  const overlaid = [...nextMessages]
+
+  let activationStreamIndex = overlaid.findIndex(
+    message =>
+      message.role === 'assistant' && message.id.startsWith('assistant-stream-') && !baselineById.has(message.id)
+  )
+
+  for (const current of currentMessages) {
+    const baseline = baselineById.get(current.id)
+    const changedSinceBaseline = !baseline || !chatMessagesEquivalent(baseline, current)
+
+    if (!changedSinceBaseline) {
+      continue
+    }
+
+    const nextIndex = nextIndexById.get(current.id)
+
+    if (nextIndex !== undefined) {
+      if (!chatMessagesEquivalent(overlaid[nextIndex], current)) {
+        overlaid[nextIndex] = current
+        changed = true
+      }
+
+      continue
+    }
+
+    if (activationStreamIndex >= 0 && current.role === 'assistant' && current.id.startsWith('assistant-stream-')) {
+      const activationStream = overlaid[activationStreamIndex]
+      const activationText = chatMessageText(activationStream)
+      const currentText = chatMessageText(current)
+
+      const replacement =
+        activationText && !currentText.startsWith(activationText)
+          ? { ...current, parts: [...activationStream.parts, ...current.parts] }
+          : current
+
+      nextIndexById.delete(activationStream.id)
+      nextIndexById.set(current.id, activationStreamIndex)
+      overlaid[activationStreamIndex] = replacement
+      activationStreamIndex = -1
+      changed = true
+
+      continue
+    }
+
+    nextIndexById.set(current.id, overlaid.length)
+    overlaid.push(current)
+    changed = true
+  }
+
+  return changed ? overlaid : nextMessages
+}
+
 export interface BranchMessage {
   content: string
   role: ChatMessage['role']
@@ -905,6 +1153,77 @@ export const toBranchMessages = (messages: ChatMessage[]): BranchMessage[] =>
   messages
     .map(message => ({ content: chatMessageText(message), role: message.role, source: message }))
     .filter(({ content, role }) => content.trim() && (role === 'assistant' || role === 'user'))
+
+/**
+ * Choose the transcript used to seed an open-chat branch.
+ *
+ * The local renderer can hold a compacted model projection, while the REST
+ * transcript contains the complete display projection. Use the latter for a
+ * whole-chat branch. When branching from a clicked bubble, map that bubble by
+ * durable row id first and by same-role/text ordinal as a legacy fallback; if
+ * it cannot be mapped, keep the local prefix rather than silently choosing a
+ * different point in the conversation.
+ */
+export function selectBranchMessages(
+  localMessages: ChatMessage[],
+  authoritativeMessages: ChatMessage[] | null,
+  messageId?: string
+): BranchMessage[] {
+  const localIndex = messageId ? localMessages.findIndex(message => message.id === messageId) : -1
+
+  if (!authoritativeMessages?.length) {
+    return toBranchMessages(localMessages.slice(0, localIndex >= 0 ? localIndex + 1 : localMessages.length))
+  }
+
+  if (!messageId) {
+    return toBranchMessages(authoritativeMessages)
+  }
+
+  if (localIndex < 0) {
+    return toBranchMessages(localMessages)
+  }
+
+  const target = localMessages[localIndex]
+
+  let authoritativeIndex =
+    target.rowId === undefined
+      ? -1
+      : authoritativeMessages.findIndex(message => message.rowId !== undefined && message.rowId === target.rowId)
+
+  // Strip `@image:` directive lines the same way the persisted→ChatMessage
+  // conversion does (extractImageRefs lifts them into attachmentRefs), so a
+  // local optimistic bubble and its authoritative twin compare equal.
+  const comparableText = (message: ChatMessage) =>
+    textWithoutEmbeddedImages(chatMessageText(message))
+      .replace(/^@image:[^\n]*\n?/gm, '')
+      .trim()
+
+  if (authoritativeIndex < 0) {
+    const targetText = comparableText(target)
+
+    const targetOrdinal = localMessages
+      .slice(0, localIndex + 1)
+      .filter(message => message.role === target.role && comparableText(message) === targetText).length
+
+    let ordinal = 0
+
+    authoritativeIndex = authoritativeMessages.findIndex(message => {
+      if (message.role !== target.role || comparableText(message) !== targetText) {
+        return false
+      }
+
+      ordinal += 1
+
+      return ordinal === targetOrdinal
+    })
+  }
+
+  if (authoritativeIndex < 0) {
+    return toBranchMessages(localMessages.slice(0, localIndex + 1))
+  }
+
+  return toBranchMessages(authoritativeMessages.slice(0, authoritativeIndex + 1))
+}
 
 export function upsertOptimisticSession(
   created: SessionCreateResponse,
@@ -974,7 +1293,9 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
 }
 
 export async function resolveStoredSession(storedSessionId: string): Promise<SessionInfo | undefined> {
-  const cached = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+  const cached = [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()].find(session =>
+    sessionMatchesStoredId(session, storedSessionId)
+  )
 
   // A row with no owning profile can't route a resume when more than one
   // profile exists — a resume without a profile lands on whichever gateway is
@@ -1254,6 +1575,33 @@ export function isSessionGoneError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err ?? '')
 
   return message.includes('404') || /session not found/i.test(message)
+}
+
+/**
+ * What to do when a resume's RPC and REST fallback BOTH came back
+ * gone-looking (#88540).
+ *
+ * A 404 is only proof of deletion when it came from the backend that owns
+ * the session. During (or moments after) a profile/connection switch the
+ * request can land on a backend that has never heard of the id — the
+ * cross-profile Bots-pane open is the reproducer: the route is written
+ * correctly, the resume races the gateway swap, both lookups 404 on the
+ * wrong backend, and the "genuinely gone" branch yanks the window to the
+ * blank new-chat route while the target session is perfectly alive.
+ *
+ * `'retry'` keeps the route and arms the bounded auto-retry (which re-runs
+ * the resume once the swap settles); `'draft'` is reserved for a session
+ * that is verifiably gone in calm conditions.
+ */
+export function goneSessionVerdict(options: {
+  /** The session was created by this window in this run — never discard. */
+  createdThisRun: boolean
+  /** A post-failure re-resolve still finds the row on SOME profile. */
+  stillListed: boolean
+  /** A profile swap or connection switch is in flight (or just targeted). */
+  switchInFlight: boolean
+}): 'draft' | 'retry' {
+  return options.createdThisRun || options.stillListed || options.switchInFlight ? 'retry' : 'draft'
 }
 
 /**
