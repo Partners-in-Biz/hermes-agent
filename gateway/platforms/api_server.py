@@ -8072,31 +8072,29 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_working_directory = body["working_directory"]
             if not isinstance(raw_working_directory, str) or not raw_working_directory.strip():
                 return web.json_response(
-                    _openai_error("'working_directory' must be a non-empty absolute path to an existing directory"),
+                    _openai_error("working_directory must be a non-empty absolute path to an existing directory"),
                     status=400,
                 )
             working_directory_path = Path(raw_working_directory.strip()).expanduser()
             try:
-                working_directory_ok = working_directory_path.is_absolute() and working_directory_path.is_dir()
+                working_directory_absolute = working_directory_path.is_absolute()
             except OSError:
-                working_directory_ok = False
-            if not working_directory_ok:
+                working_directory_absolute = False
+            if not working_directory_absolute:
                 return web.json_response(
-                    _openai_error("'working_directory' must be a non-empty absolute path to an existing directory"),
+                    _openai_error("working_directory must be a non-empty absolute path to an existing directory"),
                     status=400,
                 )
-            try:
-                canonical_working_directory = working_directory_path.resolve()
-            except OSError:
-                return web.json_response(
-                    _openai_error("'working_directory' must be a non-empty absolute path to an existing directory"),
-                    status=400,
-                )
+            # PiB: validate a working_directory_root first, then auto-create a
+            # missing working_directory inside that root so Bot-mode chat
+            # isolation folders (bots/{agentId}) exist before the run is accepted.
+            # Without a root, the path must already exist.
+            canonical_working_directory_root = None
             if "working_directory_root" in body:
                 raw_working_directory_root = body["working_directory_root"]
                 if not isinstance(raw_working_directory_root, str) or not raw_working_directory_root.strip():
                     return web.json_response(
-                        _openai_error("'working_directory_root' must contain the working directory"),
+                        _openai_error("working_directory_root must contain the working directory"),
                         status=400,
                     )
                 working_directory_root = Path(raw_working_directory_root.strip()).expanduser()
@@ -8106,21 +8104,61 @@ class APIServerAdapter(BasePlatformAdapter):
                     working_directory_root_ok = False
                 if not working_directory_root_ok:
                     return web.json_response(
-                        _openai_error("'working_directory_root' must contain the working directory"),
+                        _openai_error("working_directory_root must contain the working directory"),
                         status=400,
                     )
                 try:
                     canonical_working_directory_root = working_directory_root.resolve()
                 except OSError:
                     return web.json_response(
-                        _openai_error("'working_directory_root' must contain the working directory"),
+                        _openai_error("working_directory_root must contain the working directory"),
                         status=400,
                     )
-                if not canonical_working_directory.is_relative_to(canonical_working_directory_root):
+            try:
+                canonical_working_directory = working_directory_path.resolve(strict=True)
+            except FileNotFoundError:
+                if canonical_working_directory_root is not None:
+                    try:
+                        lexical_working_directory = working_directory_path.resolve(strict=False)
+                    except OSError:
+                        return web.json_response(
+                            _openai_error("working_directory must be a non-empty absolute path to an existing directory"),
+                            status=400,
+                        )
+                    if not lexical_working_directory.is_relative_to(canonical_working_directory_root):
+                        return web.json_response(
+                            _openai_error("working_directory must stay inside working_directory_root"),
+                            status=400,
+                        )
+                    try:
+                        lexical_working_directory.mkdir(parents=True, exist_ok=True)
+                    except OSError:
+                        return web.json_response(
+                            _openai_error("working_directory could not be created inside working_directory_root"),
+                            status=400,
+                        )
+                    try:
+                        canonical_working_directory = lexical_working_directory.resolve(strict=True)
+                    except OSError:
+                        return web.json_response(
+                            _openai_error("working_directory must be a non-empty absolute path to an existing directory"),
+                            status=400,
+                        )
+                else:
                     return web.json_response(
-                        _openai_error("'working_directory' must stay inside 'working_directory_root'"),
+                        _openai_error("working_directory must be a non-empty absolute path to an existing directory"),
                         status=400,
                     )
+            except OSError:
+                return web.json_response(
+                    _openai_error("working_directory must be a non-empty absolute path to an existing directory"),
+                    status=400,
+                )
+            if canonical_working_directory_root is not None and not canonical_working_directory.is_relative_to(canonical_working_directory_root):
+                return web.json_response(
+                    _openai_error("working_directory must stay inside working_directory_root"),
+                    status=400,
+                )
             working_directory = str(canonical_working_directory)
 
         raw_input = body.get("input")
