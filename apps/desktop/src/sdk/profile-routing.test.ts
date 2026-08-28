@@ -44,7 +44,8 @@ vi.mock('@/store/session-states', async () => {
     $focusedSessionState: atom(null),
     $focusedStoredSessionId: atom(null),
     $sessionTiles: atom([]),
-    $sessionStates: atom({})
+    $sessionStates: atom({}),
+    sessionTileDelegate: vi.fn(() => null)
   }
 })
 vi.mock('@/store/profile', async () => {
@@ -104,7 +105,8 @@ vi.mock('@/store/gateway', async () => {
   }
 })
 
-const { host } = await import('./index')
+const { BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS, DEFAULT_SESSION_HYDRATION_TIMEOUT_MS, host } = await import('./index')
+
 const { openSession: openSessionCore } = await import('@/app/open-session')
 const { deleteProfile, hermesApi } = await import('@/hermes')
 
@@ -127,8 +129,14 @@ const {
   setShowAllProfiles
 } = await import('@/store/profile')
 
-const { $focusedRuntimeId, $focusedSessionState, $focusedStoredSessionId, $sessionStates, $sessionTiles } =
-  await import('@/store/session-states')
+const {
+  $focusedRuntimeId,
+  $focusedSessionState,
+  $focusedStoredSessionId,
+  $sessionStates,
+  $sessionTiles,
+  sessionTileDelegate
+} = await import('@/store/session-states')
 
 const { setWorkspaceScope } = await import('@/components/pane-shell/workspace-scope')
 
@@ -155,6 +163,7 @@ const profile = (name: string): ProfileInfo => ({
 
 afterEach(() => {
   vi.clearAllMocks()
+  vi.mocked(sessionTileDelegate).mockReturnValue(null)
   vi.mocked(activeGatewayConnectionId).mockReturnValue('local')
   $activeGatewayProfile.set('remote-worker')
   $gatewaySwapTarget.set(null)
@@ -717,6 +726,32 @@ describe('profile-aware plugin session opens', () => {
     expect($gatewaySwapTarget.get()).toBeNull()
   })
 
+  it('refreshes an already-open Bot Chat tile instead of trusting the idle snapshot (#96183)', async () => {
+    const resumeTile = vi.fn(async () => 'runtime-bot-chat')
+
+    vi.mocked(sessionTileDelegate).mockReturnValue({ resumeTile } as never)
+    $activeGatewayProfile.set('hyoseob')
+    setMockAtom($sessionTiles, [{ storedSessionId: 'bot-chat' }] as never)
+    setMockAtom($focusedStoredSessionId, 'bot-chat')
+    setMockAtom($focusedRuntimeId, 'runtime-bot-chat')
+    setMockAtom($focusedSessionState, { messages: [{ id: 'stale-history', parts: [], role: 'assistant' }] } as never)
+
+    const opening = host.openSession('bot-chat', {
+      profile: 'hyoseob',
+      awaitHydration: true,
+      expectHistory: true,
+      forceResume: true,
+      hydrationTimeoutMs: 1_000,
+      workspaceMode: 'bots',
+      workspaceOwnerKey: 'hyoseob'
+    })
+
+    await opening
+
+    expect(resumeTile).toHaveBeenCalledWith('bot-chat', { refreshTranscript: true })
+    expect(requestSessionResume).not.toHaveBeenCalled()
+  })
+
   it('forces a resume on an explicit bot switch even when a cached transcript looks healthy (#93604)', async () => {
     // Bot-switch shape from the field: the previous visit left a non-empty
     // snapshot in the session-states cache, so the surface passes every
@@ -832,6 +867,65 @@ describe('profile-aware plugin session opens', () => {
 
     expect(setResumeExhaustedSessionId).toHaveBeenCalledWith('stranded-bot-chat')
     expect($gatewaySwapTarget.get()).toBeNull()
+  })
+
+  it('keeps the ordinary session hydration default at 20 seconds', async () => {
+    vi.useFakeTimers()
+
+    try {
+      expect(DEFAULT_SESSION_HYDRATION_TIMEOUT_MS).toBe(20_000)
+      $activeGatewayProfile.set('hyoseob')
+
+      const outcome = host
+        .openSession('slow-bot-chat', {
+          profile: 'hyoseob',
+          awaitHydration: true,
+          expectHistory: true
+        })
+        .then(
+          () => 'resolved',
+          error => String(error)
+        )
+
+      await vi.advanceTimersByTimeAsync(19_999)
+      expect(setResumeExhaustedSessionId).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await outcome).toMatch(/timed out loading/i)
+      expect(setResumeExhaustedSessionId).toHaveBeenCalledWith('slow-bot-chat')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('honors the exported 60-second Bot Chat hydration override', async () => {
+    vi.useFakeTimers()
+
+    try {
+      expect(BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS).toBe(60_000)
+      $activeGatewayProfile.set('hyoseob')
+
+      const outcome = host
+        .openSession('slow-bot-chat', {
+          profile: 'hyoseob',
+          awaitHydration: true,
+          expectHistory: true,
+          hydrationTimeoutMs: BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS
+        })
+        .then(
+          () => 'resolved',
+          error => String(error)
+        )
+
+      await vi.advanceTimersByTimeAsync(BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS - 1)
+      expect(setResumeExhaustedSessionId).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await outcome).toMatch(/timed out loading/i)
+      expect(setResumeExhaustedSessionId).toHaveBeenCalledWith('slow-bot-chat')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('retries a Bot Chat hydration timeout once without ever arming the Retry surface (#89617)', async () => {

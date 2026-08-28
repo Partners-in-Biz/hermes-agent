@@ -90,7 +90,9 @@ import {
   $focusedSessionState,
   $focusedStoredSessionId,
   $sessionStates,
-  $sessionTiles
+  $sessionTiles,
+  focusWorkspaceOwnerSessionTile,
+  sessionTileDelegate
 } from '@/store/session-states'
 import { runGatewayRestart } from '@/store/system-actions'
 import type { PaginatedSessions, UsageStats } from '@/types/hermes'
@@ -311,7 +313,12 @@ const $activeConnectionId = computed($connection, connection => {
   return connection.mode === 'local' ? 'local' : null
 })
 
-const DEFAULT_SESSION_HYDRATION_TIMEOUT_MS = 20_000
+/** Ordinary session opens fail fast when their gateway or socket is dead. */
+export const DEFAULT_SESSION_HYDRATION_TIMEOUT_MS = 20_000
+/** Cold Bot profiles get a larger per-attempt budget to start their backend
+ *  and paint durable history. Bot Mode opts into one retry, so its effective
+ *  ceiling is two bounded attempts rather than an unbounded wait. */
+export const BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS = 60_000
 let openSessionGeneration = 0
 
 export interface PluginOpenSessionOptions {
@@ -972,8 +979,25 @@ export const host = {
           // session-states cache kept across a bot switch (#93604). Callers
           // that represent an explicit user navigation pass forceResume to
           // skip the heuristic entirely; the resume is idempotent either way.
+          //
+          // Bot Chat opens as a tab/tile. requestSessionResume is consumed
+          // only when the MAIN route is that session, so a roster reopen of
+          // an already-mounted tile would paint the idle snapshot and never
+          // pull messages that arrived while the panel WS was down (#96183).
+          // Refresh the tile transcript in place instead.
           if (options.awaitHydration && (options.forceResume || !surfaceHealthy)) {
-            requestSessionResume(storedSessionId, ownerRoute || undefined)
+            const existingTile = $sessionTiles.get().some(tile => tile.storedSessionId === storedSessionId)
+            const tileDelegate = existingTile ? sessionTileDelegate() : null
+
+            if (tileDelegate) {
+              try {
+                await tileDelegate.resumeTile(storedSessionId, { refreshTranscript: true })
+              } catch {
+                requestSessionResume(storedSessionId, ownerRoute || undefined)
+              }
+            } else {
+              requestSessionResume(storedSessionId, ownerRoute || undefined)
+            }
           }
 
           if (options.awaitHydration) {
@@ -1161,6 +1185,15 @@ export const host = {
 
     window.location.hash = '#/'
   },
+
+  /** Front the tab a Bot Mode owner already has open — the tile that owner's
+   *  zone last had active, else its most recent — and return that stored id;
+   *  `null` when the owner has nothing open. A roster click asks this before
+   *  resolving the canonical chat, so the tabs the user left (and the ones
+   *  they closed) are respected. Presentation only: no gateway activation,
+   *  no session create. Feature-detect on older desktops. */
+  focusOpenWorkspaceSession: (workspaceOwnerKey: string): null | string =>
+    focusWorkspaceOwnerSessionTile(workspaceOwnerKey),
 
   /** Reactive on-screen visibility of a contributed pane: true while it is in
    *  the layout tree, not dismissed/hidden, its zone un-minimized, AND holding
@@ -1483,6 +1516,16 @@ export { type BudgetedLoop, type BudgetedLoopOptions, createBudgetedLoop } from 
 /** THE compact-number formatter — every user-facing count/token figure goes
  *  through here (1230 → "1.2k", 1_500_000 → "1.5M"). Don't hand-roll `/1000`. */
 export { compactNumber } from '@/lib/format'
+/** THE confirm flow for guarded model switches — when a gateway model-switch
+ *  RPC answers `confirm_required` (data-policy / expensive-model guard),
+ *  route it through this shared applier instead of forking a per-surface
+ *  dialog: it shows the warning and resends with
+ *  `confirm_expensive_model: true` on Confirm (#95293). */
+export {
+  type GuardedModelSwitchResult,
+  surfaceModelSwitchConfirm,
+  type SurfaceModelSwitchConfirmOptions
+} from '@/lib/guarded-model-switch'
 export { triggerHaptic as haptic } from '@/lib/haptics'
 export type { HermesOpenTarget } from '@/lib/hermes-open-target'
 /** The app's lucide icon set (RefreshCw, LayoutDashboard, Activity, …). */
