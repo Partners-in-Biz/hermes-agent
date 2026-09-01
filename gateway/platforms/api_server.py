@@ -139,6 +139,9 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms import api_server_room_dispatch as _room_dispatch
+from gateway.platforms import api_server_room_grants as _room_grants
+from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -146,6 +149,8 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
+# Re-exported here for existing imports and constructor monkeypatches.
+from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -1488,7 +1493,11 @@ def _admit_api_agent_request(handler):
     """
     @wraps(handler)
     async def _wrapped(self, request, *args, **kwargs):
-        auth_err = self._check_auth(request)
+        auth_err = (
+            self._check_run_auth(request, permission="dispatch")
+            if _api_runs._uses_room_run_auth(self, request)
+            else self._check_auth(request)
+        )
         if auth_err:
             return auth_err
         draining = self._draining_response()
@@ -1790,6 +1799,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        _api_runs._initialize_run_state(
+            self,
+            store_factory=RunIdempotencyStore,
+        )
         self._run_status_store = RunStatusStore(db_path=extra.get("run_status_db_path"))
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
@@ -2517,14 +2530,10 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
-            ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/dispatch-key", self._handle_get_run_by_dispatch_key),
-            ("GET", "/v1/runs/{run_id}", self._handle_get_run),
-            ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
-            ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
-            ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
-            ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
+        routes.extend(_room_grants._http_routes(self))
+        routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
@@ -3083,6 +3092,8 @@ class APIServerAdapter(BasePlatformAdapter):
         reasoning_override: Optional[Dict[str, Any]] = None,
         model_override: Optional[str] = None,
         provider_override: Optional[str] = None,
+        room_dispatch: Optional[Dict[str, Any]] = None,
+        room_execution_policy: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3353,8 +3364,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
-
         max_iterations = _current_max_iterations()
+        if room_dispatch is not None:
+            from gateway.hosted_room_execution_policy import RoomExecutionPolicy
+
+            policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
+            enabled_toolsets = list(policy.enabled_toolsets)
+            max_iterations = policy.max_iterations
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -3725,6 +3741,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "runs_idempotency": _api_runs._idempotency_capabilities(
+                    self,
+                    store_type=RunIdempotencyStore,
+                ),
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -5679,23 +5699,41 @@ class APIServerAdapter(BasePlatformAdapter):
         if idempotency_key:
             fp = _make_request_fingerprint(
                 body,
-                keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
+                keys=[
+                    "model",
+                    "provider",
+                    "model_options",
+                    "messages",
+                    "tools",
+                    "tool_choice",
+                    "stream",
+                ],
             )
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+                result, usage = await _idem_cache.get_or_set(
+                    idempotency_key, fp, _compute_completion
+                )
             except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                logger.error(
+                    "Error running agent for chat completions: %s", e, exc_info=True
+                )
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        f"Internal server error: {e}", err_type="server_error"
+                    ),
                     status=500,
                 )
         else:
             try:
                 result, usage = await _compute_completion()
             except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                logger.error(
+                    "Error running agent for chat completions: %s", e, exc_info=True
+                )
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        f"Internal server error: {e}", err_type="server_error"
+                    ),
                     status=500,
                 )
 
@@ -6816,11 +6854,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 ],
             )
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
+                result, usage = await _idem_cache.get_or_set(
+                    idempotency_key, fp, _compute_response
+                )
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error(
+                        f"Internal server error: {e}", err_type="server_error"
+                    ),
                     status=500,
                 )
         else:
@@ -7949,97 +7991,111 @@ class APIServerAdapter(BasePlatformAdapter):
         return current
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
-        def _push(event: Dict[str, Any]) -> None:
-            self._set_run_status(
-                run_id,
-                self._run_statuses.get(run_id, {}).get("status", "running"),
-                last_event=event.get("event"),
-            )
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
-            except Exception:
-                pass
+        return _api_runs._make_run_event_callback(
+            self,
+            run_id,
+            loop,
+            _api_server=sys.modules[__name__],
+        )
 
-        def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
-            ts = time.time()
-            if event_type == "tool.started":
-                _push({
-                    "event": "tool.started",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "tool": tool_name,
-                    "preview": preview,
-                })
-            elif event_type == "tool.completed":
-                _push({
-                    "event": "tool.completed",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "tool": tool_name,
-                    "duration": round(kwargs.get("duration", 0), 3),
-                    "error": kwargs.get("is_error", False),
-                })
-            elif event_type == "reasoning.available":
-                _push({
-                    "event": "reasoning.available",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "text": preview or "",
-                })
-            elif event_type in {"subagent.start", "subagent.complete"}:
-                event = {
-                    "event": event_type,
-                    "run_id": run_id,
-                    "timestamp": ts,
-                }
-                if preview is not None:
-                    event["preview"] = redact_sensitive_text(
-                        str(preview), force=True
-                    )
-                for key in (
-                    "goal",
-                    "task_count",
-                    "task_index",
-                    "subagent_id",
-                    "child_session_id",
-                    "parent_id",
-                    "depth",
-                    "model",
-                    "tool_count",
-                    "status",
-                    "summary",
-                    "duration_seconds",
-                    "input_tokens",
-                    "output_tokens",
-                    "reasoning_tokens",
-                    "api_calls",
-                    "cost_usd",
-                    "files_read",
-                    "files_written",
-                    "output_tail",
-                ):
-                    value = kwargs.get(key)
-                    if value is None:
-                        continue
-                    # Free-text fields can carry child terminal/tool output —
-                    # force the same secret redaction the API applies to error
-                    # text before it leaves the process on a public stream.
-                    if key in ("goal", "summary", "output_tail") and isinstance(
-                        value, str
-                    ):
-                        value = redact_sensitive_text(value, force=True)
-                    event[key] = value
-                _push(event)
-            # _thinking, subagent.tool, and subagent_progress are intentionally
-            # not forwarded on the /v1/runs stream: they are high-volume UI
-            # noise. Lifecycle boundaries (start/complete) still need to land
-            # so clients can observe delegate_task timeouts and failures.
+    def _run_idempotency_scope(self, request: "web.Request") -> str:
+        return _api_runs._run_idempotency_scope(
+            self,
+            request,
+            _api_server=sys.modules[__name__],
+        )
 
-        return _callback
+    @staticmethod
+    def _room_grant_token(request: "web.Request") -> str:
+        return _room_grants._room_grant_token(request)
+
+    def _room_grant_secret(self) -> bytes:
+        return _room_grants._room_grant_secret(self)
+
+    def _room_grant_claims(
+        self,
+        request: "web.Request",
+        *,
+        permission: str,
+    ) -> dict[str, Any]:
+        return _room_grants._room_grant_claims(
+            self,
+            request,
+            permission=permission,
+        )
+
+    def _check_run_auth(
+        self,
+        request: "web.Request",
+        *,
+        permission: str,
+    ) -> "web.Response | None":
+        return _api_runs._check_run_auth(
+            self,
+            request,
+            permission=permission,
+            _api_server=sys.modules[__name__],
+        )
+
+    async def _ensure_hosted_member_session(self, dispatch: Any) -> str:
+        return await _room_dispatch._ensure_hosted_member_session(self, dispatch)
+
+    async def _normalize_room_dispatch(
+        self,
+        request: "web.Request",
+        body: Any,
+    ) -> tuple[Any, "web.Response | None"]:
+        return await _room_dispatch._normalize_room_dispatch(
+            self,
+            request,
+            body,
+            _api_server=sys.modules[__name__],
+        )
+
+    async def _handle_room_member_invitation(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        return await _room_grants._handle_room_member_invitation(
+            self,
+            request,
+            _openai_error=_openai_error,
+            _api_request_profile=_api_request_profile,
+        )
+
+    async def _handle_room_member_capabilities(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        return await _room_grants._handle_room_member_capabilities(
+            self,
+            request,
+            _openai_error=_openai_error,
+            _api_request_profile=_api_request_profile,
+        )
+
+    async def _handle_room_member_grant_refresh(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        return await _room_grants._handle_room_member_grant_refresh(
+            self,
+            request,
+            _openai_error=_openai_error,
+            _api_request_profile=_api_request_profile,
+        )
+
+    async def _handle_room_member_grant_revoke(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        return await _room_grants._handle_room_member_grant_revoke(
+            self,
+            request,
+            _openai_error=_openai_error,
+            _api_request_profile=_api_request_profile,
+        )
+
+    def _durable_run_status(
+        self, request: "web.Request", run_id: str
+    ) -> Dict[str, Any] | None:
+        return _api_runs._durable_run_status(self, request, run_id)
 
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
@@ -8714,256 +8770,46 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
-        if status is None:
-            return web.json_response(
-                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
-                status=404,
-            )
-        return web.json_response(status)
+        return await _api_runs._handle_get_run(
+            self,
+            request,
+            _api_server=sys.modules[__name__],
+        )
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
-        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        run_id = request.match_info["run_id"]
-
-        # Allow subscribing slightly before the run is registered (race condition window)
-        for _ in range(20):
-            if run_id in self._run_streams:
-                break
-            await asyncio.sleep(0.05)
-        else:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
-
-        q = self._run_streams[run_id]
-        self._run_stream_subscribers.add(run_id)
-
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
+        """GET /v1/runs/{run_id}/events — stream structured lifecycle events."""
+        return await _api_runs._handle_run_events(
+            self,
+            request,
+            _api_server=sys.modules[__name__],
         )
-        await response.prepare(request)
-
-        try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    await response.write(b": keepalive\n\n")
-                    continue
-                if event is None:
-                    # Run finished — send final SSE comment and close
-                    await response.write(b": stream closed\n\n")
-                    break
-                payload = _sse_frame(event)
-                await response.write(payload)
-        except Exception as exc:
-            logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
-        finally:
-            self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
-
-        return response
-
 
     async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
-        """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
-        if status is None:
-            return web.json_response(
-                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
-                status=404,
-            )
-
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(_openai_error("Invalid JSON"), status=400)
-
-        raw_choice = str(body.get("choice", "")).strip().lower()
-        aliases = {"approve": "once", "approved": "once", "allow": "once"}
-        choice = aliases.get(raw_choice, raw_choice)
-        allowed = {"once", "session", "always", "deny"}
-        if choice not in allowed:
-            return web.json_response(
-                _openai_error(
-                    "Invalid approval choice; expected one of: once, session, always, deny",
-                    code="invalid_approval_choice",
-                ),
-                status=400,
-            )
-
-        approval_session_key = self._run_approval_sessions.get(run_id)
-        if not approval_session_key:
-            return web.json_response(
-                _openai_error(
-                    f"Run has no active approval session: {run_id}",
-                    code="approval_not_active",
-                ),
-                status=409,
-            )
-
-        resolve_all = (
-            _coerce_request_bool(body.get("all"), default=False)
-            or _coerce_request_bool(body.get("resolve_all"), default=False)
+        """POST /v1/runs/{run_id}/approval — resolve a pending approval."""
+        return await _api_runs._handle_run_approval(
+            self,
+            request,
+            _api_server=sys.modules[__name__],
         )
-        try:
-            from tools.approval import resolve_gateway_approval
-
-            resolved = resolve_gateway_approval(
-                approval_session_key,
-                choice,
-                resolve_all=resolve_all,
-            )
-        except Exception as exc:
-            logger.exception("[api_server] approval resolution failed for run %s", run_id)
-            return web.json_response(_openai_error(str(exc)), status=500)
-
-        if resolved <= 0:
-            return web.json_response(
-                _openai_error(
-                    f"Run has no pending approval: {run_id}",
-                    code="approval_not_pending",
-                ),
-                status=409,
-            )
-
-        self._set_run_status(run_id, "running", last_event="approval.responded")
-        q = self._run_streams.get(run_id)
-        if q is not None:
-            try:
-                q.put_nowait({
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "choice": choice,
-                    "resolved": resolved,
-                })
-            except Exception:
-                pass
-
-        return web.json_response({
-            "object": "hermes.run.approval_response",
-            "run_id": run_id,
-            "choice": choice,
-            "resolved": resolved,
-        })
 
     async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
-        if status is None:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
-        # Only genuinely running runs are steerable.  /stop retains agent/task
-        # refs during cooperative shutdown, so the status gate (not the mere
-        # presence of an agent ref) is what rejects stop-then-steer.
-        agent = self._active_run_agents.get(run_id)
-        if status.get("status") != "running" or not hasattr(agent, "steer"):
-            return web.json_response(
-                _openai_error(
-                    f"Run is not currently accepting steer input: {run_id}",
-                    code="run_not_accepting_steer",
-                ),
-                status=409,
-            )
-
-        body, err = await self._read_json_body(request)
-        if err:
-            return err
-        raw_text = body.get("input") or body.get("message") or body.get("text") or ""
-        steer_text = _normalize_chat_content(raw_text).strip()
-        if not steer_text:
-            return web.json_response(
-                _openai_error(
-                    "Missing non-empty steer text; expected 'input', 'message', or 'text'.",
-                    code="invalid_steer_input",
-                ),
-                status=400,
-            )
-
-        try:
-            accepted = bool(agent.steer(steer_text))
-        except Exception as exc:
-            logger.exception("[api_server] steer failed for run %s", run_id)
-            return web.json_response(_openai_error(_redact_api_error_text(exc), code="steer_failed"), status=500)
-        if not accepted:
-            return web.json_response(
-                _openai_error(f"Run did not accept steer text: {run_id}", code="steer_not_accepted"),
-                status=409,
-            )
-
-        self._set_run_status(run_id, "running", last_event="run.steered")
-        q = self._run_streams.get(run_id)
-        if q is not None:
-            with suppress(Exception):
-                q.put_nowait({
-                    "event": "run.steered",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "accepted": True,
-                })
-        return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
+        return await _api_runs._handle_steer_run(
+            self,
+            request,
+            _api_server=sys.modules[__name__],
+        )
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        run_id = request.match_info["run_id"]
-        agent = self._active_run_agents.get(run_id)
-        task = self._active_run_tasks.get(run_id)
-
-        if agent is None and task is None:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
-
-        self._set_run_status(run_id, "stopping", last_event="run.stopping")
-        self._stopping_run_ids.add(run_id)
-
-        if agent is not None:
-            try:
-                request_hard_interrupt(agent, "Stop requested via API")
-            except Exception:
-                pass
-            # The stopped run is abandoned — reap only the background
-            # processes it created (#76115). Epoch-gated inside, so a
-            # concurrent run sharing the same session_id keeps its own
-            # processes; no-op if the run already finished and cleared
-            # its ownership markers.
-            _reap_disconnected_agent_processes(
-                agent, source="api_server_run_stop"
-            )
-
-        return web.json_response({"run_id": run_id, "status": "stopping"})
+        return await _api_runs._handle_stop_run(
+            self,
+            request,
+            _api_server=sys.modules[__name__],
+        )
 
     async def _sweep_orphaned_runs(self) -> None:
-        """Periodically expire transport buffers and terminal status records."""
-        while True:
-            await asyncio.sleep(60)
-            self._sweep_orphaned_runs_once(time.time())
+        return await _api_runs._sweep_orphaned_runs(self)
 
     def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
         """Expire old SSE buffers without treating transport age as run age."""
