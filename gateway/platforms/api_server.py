@@ -8920,6 +8920,9 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return web.json_response(status)
 
+    def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
+        return _api_runs._request_owns_run(self, request, run_id)
+
     def _release_run_owner_if_forgotten(self, run_id: str) -> None:
         _api_runs._release_run_owner_if_forgotten(self, run_id)
 

@@ -361,7 +361,17 @@ def _durable_run_status(
         retention_until=_room_retention_until(request),
     )
     if record is None:
-        return None
+        store = getattr(self, "_run_status_store", None)
+        try:
+            persisted = store.get(run_id) if store is not None else None
+        except Exception:
+            persisted = None
+        if not isinstance(persisted, dict):
+            return None
+        status = dict(persisted)
+        self._run_statuses[run_id] = status
+        self._run_owners.setdefault(run_id, scope)
+        return status
 
     status = dict(record["status"])
     owner_pid = int(record.get("owner_pid") or 0)
@@ -1062,13 +1072,33 @@ def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
     scope = self._run_idempotency_scope(request)
     owner = self._run_owners.get(run_id)
     if owner is not None:
-        return owner == scope
-    # No in-memory owner: only a durable record under the caller's own scope
-    # admits it. Run state that exists without an owner stamp is an
-    # unanswered authorization question, not a run anyone may control —
-    # under gateway.multiplex_profiles every served profile holds a valid
-    # key, so admitting it would make the boundary allow-all (#93689).
-    return self._run_idempotency_store.owns_run(scope, run_id)
+        if owner == scope:
+            return True
+    elif self._run_idempotency_store.owns_run(scope, run_id):
+        return True
+    # pib: dedicated-listener run lookup
+    # PiB chat polls GET /v1/runs/{id} with API_SERVER_KEY and no
+    # Idempotency-Key. On a single-profile gateway the in-memory owner
+    # stamp can disagree with the GET scope (profile ContextVar default
+    # vs unset) and the idempotency store is empty, so the poller 404s
+    # while the run completed in RunStatusStore. Multiplexed /p/<profile>
+    # requests still fail closed on owner mismatch (#93689).
+    try:
+        from gateway.platforms.api_server import _api_request_profile
+        profile = _api_request_profile.get()
+    except Exception:
+        profile = None
+    if profile and profile != "default":
+        return False
+    if run_id in getattr(self, "_run_statuses", {}):
+        return True
+    store = getattr(self, "_run_status_store", None)
+    try:
+        if store is not None and store.get(run_id) is not None:
+            return True
+    except Exception:
+        return False
+    return False
 
 
 async def _handle_get_run(
